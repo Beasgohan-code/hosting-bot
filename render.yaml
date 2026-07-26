@@ -1,10 +1,10 @@
-<?xml version="1.0" encoding="UTF-8"?>
-<Error>
-  <Code>NoSuchKey</Code>
-  <Message>The specified key does not exist.</Message>
-  <RequestId>6A663E044FCC4A3437CF8CCE</RequestId>
-  <HostId>kimi-bj-search.oss-cn-beijing.aliyuncs.com</HostId>
-  <Key>img/sandbox:///mnt/agents/output/deploy_package/render.yaml</Key>
-  <EC>0026-00000001</EC>
-  <RecommendDoc>https://api.aliyun.com/troubleshoot?q=0026-00000001</RecommendDoc>
-</Error>
+services:
+  - type: worker
+    name: ultimate-hosting-bot
+    runtime: python
+    plan: free
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "python ultimate_hosting_bot_fixed.py"
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11
