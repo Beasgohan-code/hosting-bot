@@ -91,3 +91,9 @@ def create_plugin():
 ```
 
 The runtime isolates import and lifecycle failures, exposes a stable `PluginContext` containing the config, database, process manager, log streamer, and UI factory, and reports extension health through `/health`. Privileged plugins must perform their own user checks; the built-in admin plugin demonstrates the expected pattern.
+
+## Live dashboard visualization
+
+The web dashboard now includes a live infrastructure topology on the Overview page. The Three.js scene renders the control plane as a central hub with service nodes, connection lines, runtime-colored halos, hover states, and clickable labels that open the existing service drawer. Anime.js handles node entrance, selection, and rotation transitions while respecting the dashboard’s reduced-motion styling.
+
+The browser subscribes to `GET /api/events` using Server-Sent Events. Every service mutation broadcasts a fresh overview payload containing services, activity, and metrics, so start, stop, deploy, redeploy, and delete actions appear without a manual refresh. The existing periodic fetch remains as a lightweight fallback if the stream is unavailable.

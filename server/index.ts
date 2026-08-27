@@ -57,12 +57,32 @@ const statusInput = z.object({ status: z.enum(["live", "stopped"]) });
 let services: Service[] = [];
 let activities: Activity[] = [];
 const deploymentTimers = new Map<string, NodeJS.Timeout>();
+const eventClients = new Set<Response>();
 
 const now = () => new Date().toISOString();
+
+function overviewPayload() {
+  const live = services.filter((service) => service.status === "live").length;
+  const building = services.filter((service) => service.status === "building").length;
+  const memory = services.reduce((sum, service) => sum + service.memory, 0);
+  return {
+    services: services.map(publicService),
+    activities,
+    metrics: { live, building, total: services.length, memory, uptime: "99.98%", requests: "1.24M" },
+  };
+}
+
+function broadcastOverview() {
+  const message = `event: overview\\ndata: ${JSON.stringify(overviewPayload())}\\n\\n`;
+  for (const client of eventClients) {
+    try { client.write(message); } catch { eventClients.delete(client); }
+  }
+}
 
 async function persist() {
   await fs.mkdir(dataDir, { recursive: true });
   await fs.writeFile(dataFile, JSON.stringify({ services, activities }, null, 2));
+  broadcastOverview();
 }
 
 async function load() {
@@ -151,16 +171,23 @@ app.use(express.json({ limit: "100kb" }));
 
 app.get("/api/health", (_req, res) => res.json({ ok: true, service: "hosting-bot", timestamp: now() }));
 
-app.get("/api/overview", (_req, res) => {
-  const live = services.filter((service) => service.status === "live").length;
-  const building = services.filter((service) => service.status === "building").length;
-  const memory = services.reduce((sum, service) => sum + service.memory, 0);
-  res.json({
-    services: services.map(publicService),
-    activities,
-    metrics: { live, building, total: services.length, memory, uptime: "99.98%", requests: "1.24M" },
-  });
+app.get("/api/overview", (_req, res) => res.json(overviewPayload()));
+
+app.get("/api/events", (req, res) => {
+  res.setHeader("Content-Type", "text/event-stream");
+  res.setHeader("Cache-Control", "no-cache");
+  res.setHeader("Connection", "keep-alive");
+  res.flushHeaders();
+  eventClients.add(res);
+  res.write(`event: overview\\ndata: ${JSON.stringify(overviewPayload())}\\n\\n`);
+  req.on("close", () => eventClients.delete(res));
 });
+
+setInterval(() => {
+  for (const client of eventClients) {
+    try { client.write(": heartbeat\\n\\n"); } catch { eventClients.delete(client); }
+  }
+}, 15000);
 
 app.post("/api/services", async (req: Request, res: Response) => {
   const parsed = serviceInput.safeParse(req.body);

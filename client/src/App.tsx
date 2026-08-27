@@ -39,29 +39,9 @@ import {
   X,
   Zap,
 } from "lucide-react";
+import ServiceTopology from "./components/ServiceTopology";
+import type { ActivityItem, Metrics, Runtime, Service, ServiceStatus } from "./types";
 import "./styles.css";
-
-type ServiceStatus = "live" | "building" | "stopped" | "failed";
-type Runtime = "Node.js" | "Python" | "Docker";
-type Service = {
-  id: string;
-  name: string;
-  repoUrl: string;
-  branch: string;
-  runtime: Runtime;
-  region: string;
-  status: ServiceStatus;
-  url: string;
-  lastDeploy: number;
-  createdAt: number;
-  updatedAt: number;
-  buildTime: string;
-  cpu: number;
-  memory: number;
-  description: string;
-};
-type ActivityItem = { id: string; serviceName: string; action: string; detail: string; createdAt: string; tone: "success" | "info" | "warning" };
-type Metrics = { live: number; building: number; total: number; memory: number; uptime: string; requests: string };
 
 const fallbackServices: Service[] = [
   { id: "svc_gateway", name: "telegram-gateway", repoUrl: "https://github.com/Beasgohan-code/hosting-bot", branch: "main", runtime: "Python", region: "Singapore (southeast-1)", status: "live", url: "telegram-gateway.hosting.bot", lastDeploy: Date.now() - 1080000, createdAt: Date.now(), updatedAt: Date.now(), buildTime: "42s", cpu: 12, memory: 148, description: "Telegram worker with auto-healing and log streaming" },
@@ -78,6 +58,7 @@ function App() {
   const [selected, setSelected] = useState<Service | null>(null);
   const [query, setQuery] = useState("");
   const [notice, setNotice] = useState("");
+  const [streamConnected, setStreamConnected] = useState(false);
 
   async function refresh() {
     try {
@@ -92,9 +73,22 @@ function App() {
     }
   }
 
-  useEffect(() => { void refresh(); }, []);
   useEffect(() => {
-    const timer = window.setInterval(() => void refresh(), 5000);
+    void refresh();
+    const source = new EventSource("/api/events");
+    source.addEventListener("overview", (event) => {
+      const data = JSON.parse((event as MessageEvent).data) as { services: Service[]; activities: ActivityItem[]; metrics: Metrics };
+      setServices(data.services);
+      setActivities(data.activities);
+      setMetrics(data.metrics);
+      setStreamConnected(true);
+    });
+    source.onopen = () => setStreamConnected(true);
+    source.onerror = () => setStreamConnected(false);
+    return () => source.close();
+  }, []);
+  useEffect(() => {
+    const timer = window.setInterval(() => void refresh(), 15000);
     return () => window.clearInterval(timer);
   }, []);
   useEffect(() => {
@@ -160,7 +154,7 @@ function App() {
       <main className="main-content">
         <header className="topbar"><button className="mobile-menu"><Menu size={18} /></button><div className="breadcrumb"><span>Beasgohan labs</span><span>/</span><strong>{activeSection}</strong></div><div className="top-actions"><div className="system-pill"><span className="pulse" /> All systems operational</div><button className="icon-button" onClick={() => showNotice("Keyboard shortcuts: ⌘ K to search")}> <CircleHelp size={17} /></button><div className="top-avatar">BG</div></div></header>
         <div className="content-wrap">
-          {activeSection === "Overview" && <Overview metrics={metrics} services={services} activities={activities} filteredServices={filteredServices} query={query} setQuery={setQuery} onDeploy={() => setShowDeploy(true)} onSelect={setSelected} onStatus={changeStatus} onRedeploy={redeploy} showNotice={showNotice} />}
+          {activeSection === "Overview" && <Overview metrics={metrics} services={services} activities={activities} filteredServices={filteredServices} query={query} setQuery={setQuery} onDeploy={() => setShowDeploy(true)} onSelect={setSelected} selectedId={selected?.id} connected={streamConnected} onStatus={changeStatus} onRedeploy={redeploy} showNotice={showNotice} />}
           {activeSection === "Services" && <ServicesPage services={filteredServices} query={query} setQuery={setQuery} onDeploy={() => setShowDeploy(true)} onSelect={setSelected} onStatus={changeStatus} onRedeploy={redeploy} />}
           {activeSection === "Activity" && <ActivityPage activities={activities} />}
           {activeSection === "Deployments" && <DeploymentsPage services={services} onRedeploy={redeploy} onSelect={setSelected} />}
@@ -207,10 +201,11 @@ function StatusBadge({ status }: { status: ServiceStatus }) { return <span class
 function RuntimeIcon({ runtime }: { runtime: Runtime }) { return runtime === "Node.js" ? <Code2 size={15} /> : runtime === "Python" ? <SquareTerminal size={15} /> : <Box size={15} />; }
 function timeAgo(value: number | string) { const delta = Math.max(0, Date.now() - new Date(value).getTime()); const mins = Math.floor(delta / 60000); if (mins < 1) return "just now"; if (mins < 60) return `${mins}m ago`; const hours = Math.floor(mins / 60); if (hours < 24) return `${hours}h ago`; return `${Math.floor(hours / 24)}d ago`; }
 
-function Overview({ metrics, services, activities, filteredServices, query, setQuery, onDeploy, onSelect, onStatus, onRedeploy, showNotice }: { metrics: Metrics; services: Service[]; activities: ActivityItem[]; filteredServices: Service[]; query: string; setQuery: (value: string) => void; onDeploy: () => void; onSelect: (service: Service) => void; onStatus: (service: Service, status: "live" | "stopped") => void; onRedeploy: (service: Service) => void; showNotice: (message: string) => void }) {
+function Overview({ metrics, services, activities, filteredServices, query, setQuery, onDeploy, onSelect, selectedId, connected, onStatus, onRedeploy, showNotice }: { metrics: Metrics; services: Service[]; activities: ActivityItem[]; filteredServices: Service[]; query: string; setQuery: (value: string) => void; onDeploy: () => void; onSelect: (service: Service) => void; selectedId?: string; connected: boolean; onStatus: (service: Service, status: "live" | "stopped") => void; onRedeploy: (service: Service) => void; showNotice: (message: string) => void }) {
   return <>
     <div className="hero animate-in"><div><div className="eyebrow"><Sparkles size={13} /> DEPLOYMENT CONTROL PLANE</div><h1>Ship <span>calmly.</span></h1><p>One quiet place to deploy, observe, and keep every service healthy.</p></div><div className="hero-actions"><button className="button secondary" onClick={() => showNotice("Project settings coming soon")}><Settings2 size={15} /> Project settings</button><button className="button primary" onClick={onDeploy}><Plus size={16} /> New service</button></div></div>
     <div className="metric-grid animate-in"><MetricCard icon={<Zap />} label="Live services" value={String(metrics.live)} detail={`${metrics.total} total services`} tone="lime" /><MetricCard icon={<TrendingUp />} label="30d uptime" value={metrics.uptime} detail="Across all production" tone="blue" /><MetricCard icon={<Cpu />} label="Memory usage" value={`${metrics.memory} MB`} detail="of 7.5 GB workspace" tone="violet" /><MetricCard icon={<Activity />} label="Requests today" value={metrics.requests} detail="+18.4% from yesterday" tone="orange" /></div>
+    <ServiceTopology services={services} selectedId={selectedId} onSelect={onSelect} connected={connected} />
     <div className="section-head animate-in"><div><div className="section-kicker"><span className="live-pulse" /> ACTIVE SERVICES</div><h2>Services <span>{services.length}</span></h2></div><div className="section-tools"><div className="search-box"><Search size={15} /><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search services" /></div><button className="button primary compact" onClick={onDeploy}><Plus size={15} /> New service</button></div></div>
     <div className="service-grid">{filteredServices.map((service) => <ServiceCard key={service.id} service={service} onSelect={onSelect} onStatus={onStatus} onRedeploy={onRedeploy} />)}{filteredServices.length === 0 && <EmptyState onDeploy={onDeploy} />}</div>
     <div className="lower-grid animate-in"><div className="panel activity-panel"><div className="panel-head"><div><span className="section-kicker">RECENT ACTIVITY</span><h3>Deployment stream</h3></div><button className="text-button" onClick={() => showNotice("Activity view is available in the sidebar")}>View all <ArrowUpRight size={13} /></button></div>{(activities.length ? activities.slice(0, 4) : fallbackActivity).map((item) => <ActivityRow key={item.id} item={item} />)}</div><div className="panel quick-panel"><div className="panel-head"><div><span className="section-kicker">QUICK ACCESS</span><h3>Build something</h3></div><Sparkles size={17} className="muted-icon" /></div><div className="quick-links"><button onClick={onDeploy}><div className="quick-icon cyan"><Rocket size={16} /></div><div><strong>Deploy a service</strong><span>Connect a Git repository</span></div><ArrowUpRight size={14} /></button><button onClick={() => showNotice("Logs are available from a service detail view")}><div className="quick-icon purple"><Terminal size={16} /></div><div><strong>Inspect logs</strong><span>Stream runtime output</span></div><ArrowUpRight size={14} /></button><button onClick={() => showNotice("Documentation portal coming soon")}><div className="quick-icon orange"><LifeBuoy size={16} /></div><div><strong>Read the docs</strong><span>Learn the deployment flow</span></div><ArrowUpRight size={14} /></button></div></div></div>
