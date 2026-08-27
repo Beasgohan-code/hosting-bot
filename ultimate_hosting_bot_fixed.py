@@ -23,6 +23,9 @@ from dataclasses import dataclass, asdict
 from typing import Dict, Optional, List
 from enum import Enum
 from collections import defaultdict
+from types import SimpleNamespace
+
+from bot_plugins.core import PluginManager
 
 from telegram import (
     Update, InlineKeyboardButton, InlineKeyboardMarkup,
@@ -1437,13 +1440,33 @@ async def auto_heal_task(context: ContextTypes.DEFAULT_TYPE):
 # ═══════════════════════════════════════════════════════════════════
 
 def main():
-    application = Application.builder().token(Config.BOT_TOKEN).build()
+    if not Config.BOT_TOKEN:
+        raise RuntimeError("BOT_TOKEN is required. Set it in the environment before starting the worker.")
 
-    application.bot.set_my_commands([
-        BotCommand("start", "🚀 Open main menu"),
-        BotCommand("logs", "📜 View bot logs (/logs <id> [lines])"),
-        BotCommand("cancel", "❌ Cancel operation")
-    ])
+    application = Application.builder().token(Config.BOT_TOKEN).build()
+    plugin_context = SimpleNamespace(
+        config=Config,
+        db=db,
+        process_mgr=process_mgr,
+        log_streamer=log_streamer,
+        ui=ui,
+    )
+    plugin_manager = PluginManager(application, plugin_context)
+    application.bot_data["plugin_context"] = plugin_context
+    application.bot_data["plugin_manager"] = plugin_manager
+    plugin_manager.discover()
+
+    async def startup_job(context: ContextTypes.DEFAULT_TYPE):
+        await context.bot.set_my_commands([
+            BotCommand("start", "🚀 Open main menu"),
+            BotCommand("logs", "📜 View bot logs (/logs <id> [lines])"),
+            BotCommand("cancel", "❌ Cancel operation"),
+            *plugin_manager.bot_commands(),
+        ])
+        await plugin_manager.startup()
+
+    application.job_queue.run_once(startup_job, when=0)
+
 
     deploy_conv = ConversationHandler(
         entry_points=[CallbackQueryHandler(callback_router, pattern="^nav_deploy$")],
@@ -1482,7 +1505,7 @@ def main():
         when=5
     )
 
-    logger.info("🤖 ULTIMATE HOSTING BOT v3.1 STARTED")
+    logger.info("🤖 ULTIMATE HOSTING BOT v4.0 STARTED with %s plugins", len([p for p in plugin_manager.loaded if p.enabled]))
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":

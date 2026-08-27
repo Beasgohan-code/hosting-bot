@@ -58,3 +58,36 @@ The included `render.yaml` creates two services: a Node web service named `hosti
 ## Next production steps
 
 The current implementation is a durable single-instance control plane rather than a multi-tenant PaaS. The next hardening steps are authenticated users and teams, Postgres-backed service state, Redis-backed deployment jobs, signed GitHub webhooks, per-service isolated containers, resource quotas, and log streaming over Server-Sent Events or WebSockets.
+
+## Telegram plugin system
+
+The Telegram worker now loads extensions through `bot_plugins.core.PluginManager`. Built-in plugins are discovered automatically at startup, and additional modules can be loaded with the comma-separated `PLUGIN_MODULES` environment variable. Each plugin is a normal Python module with a `create_plugin()` factory returning a `BotPlugin` instance.
+
+| Plugin | Commands | Purpose |
+| --- | --- | --- |
+| `diagnostics` | `/health`, `/plugins`, `/stats` | Inspect health, loaded extensions, and aggregate service counts |
+| `services` | `/services`, `/service <bot_id>` | List hosted services and inspect one service |
+| `admin` | `/admin`, `/restartall` | Guarded admin summary and production restarts |
+| `example` | `/ping` | Reference local extension in `bot_plugins/local/example_plugin.py` |
+
+A minimal extension looks like this:
+
+```python
+from telegram import Update
+from telegram.ext import CommandHandler, ContextTypes
+from bot_plugins.core import BotPlugin, PluginSpec
+
+class MetricsPlugin(BotPlugin):
+    spec = PluginSpec("metrics", "1.0.0", "Runtime metrics", (("metrics", "Show metrics"),))
+
+    def handlers(self):
+        return (CommandHandler("metrics", self.metrics),)
+
+    async def metrics(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        await update.message.reply_text("Metrics are ready")
+
+def create_plugin():
+    return MetricsPlugin()
+```
+
+The runtime isolates import and lifecycle failures, exposes a stable `PluginContext` containing the config, database, process manager, log streamer, and UI factory, and reports extension health through `/health`. Privileged plugins must perform their own user checks; the built-in admin plugin demonstrates the expected pattern.
