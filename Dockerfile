@@ -1,13 +1,13 @@
-FROM python:3.11-slim
+FROM node:22-bookworm-slim
 
 WORKDIR /app
 
-# Install git (needed for cloning repos)
-RUN apt-get update && apt-get install -y git && rm -rf /var/lib/apt/lists/*
-
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+COPY package.json ./
+RUN npm install
 
 COPY . .
+RUN npm run build
 
-CMD ["python", "ultimate_hosting_bot_fixed.py"]
+ENV NODE_ENV=production
+EXPOSE 8787
+CMD ["npm", "start"]

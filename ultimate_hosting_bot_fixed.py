@@ -38,8 +38,8 @@ from telegram.ext import (
 # ═══════════════════════════════════════════════════════════════════
 
 class Config:
-    BOT_TOKEN: str = "YOUR_BOT_TOKEN_HERE"      # ← CHANGE THIS
-    ADMIN_IDS: List[int] = [123456789]           # ← YOUR TELEGRAM ID
+    BOT_TOKEN: str = os.getenv("BOT_TOKEN", "")
+    ADMIN_IDS: List[int] = [int(value.strip()) for value in os.getenv("ADMIN_IDS", "").split(",") if value.strip().isdigit()]
 
     # Auto-detect base dir: uses ./hosting_data in same folder as script
     BASE_DIR: Path = Path(__file__).parent / "hosting_data"

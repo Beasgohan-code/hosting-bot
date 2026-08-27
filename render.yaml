@@ -1,10 +1,22 @@
 services:
-  - type: worker
-    name: ultimate-hosting-bot
-    runtime: python
+  - type: web
+    name: hosting-bot-control-plane
+    runtime: node
     plan: free
-    buildCommand: "pip install -r requirements.txt"
-    startCommand: "python ultimate_hosting_bot_fixed.py"
+    buildCommand: npm install && npm run build
+    startCommand: npm start
+    healthCheckPath: /api/health
     envVars:
-      - key: PYTHON_VERSION
-        value: 3.11
+      - key: NODE_VERSION
+        value: 22
+
+  - type: worker
+    name: hosting-bot-telegram-worker
+    runtime: docker
+    plan: free
+    dockerfilePath: ./Dockerfile.bot
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: ADMIN_IDS
+        sync: false
