@@ -54,7 +54,7 @@ export function KeepAlivePage({ monitors, apiOnline, checkingId, onAdd, onCheck,
         <div>
           <span className="section-kicker">UPTIME & KEEP-ALIVE</span>
           <h1>Keep-alive</h1>
-          <p>Probe public health endpoints on a schedule and get alerted when they go down or recover.</p>
+          <p>Probe public health endpoints on a schedule and review their real response history.</p>
         </div>
         <button className="button primary" onClick={onAdd} disabled={!apiOnline}>
           <Plus size={16} /> Add monitor
@@ -65,8 +65,8 @@ export function KeepAlivePage({ monitors, apiOnline, checkingId, onAdd, onCheck,
         <div className="monitor-notice">
           <CircleAlert size={16} />
           <div>
-            <strong>Persistent control plane required</strong>
-            <span>This preview is static. Run the Node control-plane service to create monitors and keep scheduled checks running. Vercel serverless functions cannot host the always-on scheduler.</span>
+            <strong>Control-plane API is offline</strong>
+            <span>Monitor data and scheduled checks are served by the persistent Node control-plane service. Reconnect it to view current readings or make changes.</span>
           </div>
         </div>
       )}
@@ -127,7 +127,7 @@ export function KeepAlivePage({ monitors, apiOnline, checkingId, onAdd, onCheck,
           <div className="monitor-empty-icon"><HeartPulse size={22} /></div>
           <span className="section-kicker">NO TARGETS YET</span>
           <h2>Keep your endpoints on your radar.</h2>
-          <p>Add a public health URL. Hosting Bot will check it at your chosen interval, keep a small recent history, and notify you on state changes in Telegram.</p>
+          <p>Add a public health URL. Hosting Bot will check it at your chosen interval, keep recent response history, and record state changes in the activity feed.</p>
           <button className="button primary" onClick={onAdd} disabled={!apiOnline}><Plus size={15} /> Add your first monitor</button>
         </div>
       )}
@@ -155,7 +155,7 @@ export function KeepAliveModal({ onClose, onCreate }: { onClose: () => void; onC
     <div className="modal-backdrop" onMouseDown={(event) => event.target === event.currentTarget && onClose()}>
       <form className="modal" onSubmit={submit}>
         <div className="modal-head">
-          <div><span className="section-kicker">UPTIME MONITOR</span><h2>Add keep-alive target</h2><p>Schedule safe HTTP checks and get Telegram alerts on changes.</p></div>
+          <div><span className="section-kicker">UPTIME MONITOR</span><h2>Add keep-alive target</h2><p>Schedule safe HTTP checks and record actual responses over time.</p></div>
           <button type="button" className="icon-button" onClick={onClose}><X size={17} /></button>
         </div>
         <label>Display name <span className="optional">optional</span><input value={name} onChange={(event) => setName(event.target.value)} placeholder="e.g. production health" maxLength={48} /></label>

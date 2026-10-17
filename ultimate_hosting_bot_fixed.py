@@ -18,6 +18,8 @@ import logging
 import shutil
 import subprocess
 import uuid
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from threading import Thread
 from pathlib import Path
 from datetime import datetime
 from dataclasses import dataclass, asdict
@@ -58,6 +60,8 @@ class Config:
     AUTO_HEAL_WINDOW_SECONDS: int = max(60, int(os.getenv("AUTO_HEAL_WINDOW_SECONDS", "600")))
     KEEPALIVE_SWEEP_INTERVAL: int = max(5, int(os.getenv("KEEPALIVE_SWEEP_INTERVAL", "15")))
     KEEPALIVE_TIMEOUT_SECONDS: int = max(2, int(os.getenv("KEEPALIVE_TIMEOUT_SECONDS", "10")))
+    HEALTH_HOST: str = os.getenv("HEALTH_HOST", "0.0.0.0")
+    HEALTH_PORT: int = max(0, int(os.getenv("HEALTH_PORT", "8788")))
     LOG_TAIL_LINES: int = 50
     DEPLOY_TIMEOUT: int = 120
 
@@ -82,6 +86,70 @@ logging.basicConfig(
     ]
 )
 logger = logging.getLogger("UltimateHost")
+
+
+class WorkerHealthHandler(BaseHTTPRequestHandler):
+    """Minimal dependency-free liveness/readiness endpoint for containers."""
+
+    def do_GET(self):
+        route = self.path.split("?", 1)[0]
+        if route not in {"/healthz", "/livez", "/readyz"}:
+            self.send_error(404)
+            return
+
+        ready = bool(getattr(self.server, "ready", False))
+        payload = {
+            "service": "hosting-bot-telegram-worker",
+            "ok": True,
+            "ready": ready,
+            "uptimeSeconds": max(0, int(time.monotonic() - self.server.started_monotonic)),
+        }
+        body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+        status = 503 if route == "/readyz" and not ready else 200
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, format, *args):
+        logger.debug("health endpoint: %s", format % args)
+
+
+class WorkerHealthServer:
+    def __init__(self, host: str, port: int):
+        self.host = host
+        self.port = port
+        self.server = None
+        self.thread: Optional[Thread] = None
+
+    def start(self):
+        if self.port == 0:
+            logger.info("Worker health endpoint disabled")
+            return
+        self.server = ThreadingHTTPServer((self.host, self.port), WorkerHealthHandler)
+        self.server.daemon_threads = True
+        self.server.ready = False
+        self.server.started_monotonic = time.monotonic()
+        self.thread = Thread(target=self.server.serve_forever, name="worker-health-http", daemon=True)
+        self.thread.start()
+        logger.info("Worker health endpoint listening on %s:%s", self.host, self.port)
+
+    def set_ready(self, ready: bool):
+        if self.server is not None:
+            self.server.ready = ready
+
+    def stop(self):
+        if self.server is None:
+            return
+        self.server.ready = False
+        self.server.shutdown()
+        self.server.server_close()
+        if self.thread is not None:
+            self.thread.join(timeout=2)
+        self.server = None
+        self.thread = None
 
 # ═══════════════════════════════════════════════════════════════════
 # ENUMS & DATA CLASSES
@@ -1565,7 +1633,38 @@ def main():
     if not Config.BOT_TOKEN:
         raise RuntimeError("BOT_TOKEN is required. Set it in the environment before starting the worker.")
 
-    application = Application.builder().token(Config.BOT_TOKEN).build()
+    health_server = WorkerHealthServer(Config.HEALTH_HOST, Config.HEALTH_PORT)
+
+    async def post_init(application: Application):
+        manager: PluginManager = application.bot_data["plugin_manager"]
+        await application.bot.set_my_commands([
+            BotCommand("start", "🚀 Open main menu"),
+            BotCommand("logs", "📜 View bot logs (/logs <id> [lines])"),
+            BotCommand("cancel", "❌ Cancel operation"),
+            *manager.bot_commands(),
+        ])
+        await manager.startup()
+        health_server.set_ready(True)
+        logger.info("Telegram application is ready")
+
+    async def post_stop(application: Application):
+        health_server.set_ready(False)
+        manager: PluginManager | None = application.bot_data.get("plugin_manager")
+        if manager is not None:
+            await manager.shutdown()
+        logger.info("Telegram plugins shut down")
+
+    async def post_shutdown(_application: Application):
+        logger.info("Telegram application shutdown complete")
+
+    application = (
+        Application.builder()
+        .token(Config.BOT_TOKEN)
+        .post_init(post_init)
+        .post_stop(post_stop)
+        .post_shutdown(post_shutdown)
+        .build()
+    )
     plugin_context = SimpleNamespace(
         config=Config,
         db=db,
@@ -1578,18 +1677,6 @@ def main():
     application.bot_data["plugin_manager"] = plugin_manager
     plugin_manager.discover()
 
-    async def startup_job(context: ContextTypes.DEFAULT_TYPE):
-        await context.bot.set_my_commands([
-            BotCommand("start", "🚀 Open main menu"),
-            BotCommand("logs", "📜 View bot logs (/logs <id> [lines])"),
-            BotCommand("cancel", "❌ Cancel operation"),
-            *plugin_manager.bot_commands(),
-        ])
-        await plugin_manager.startup()
-
-    application.job_queue.run_once(startup_job, when=0)
-
-
     deploy_conv = ConversationHandler(
         entry_points=[CallbackQueryHandler(callback_router, pattern="^nav_deploy$")],
         states={
@@ -1597,22 +1684,22 @@ def main():
             ST_DEPLOY_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, deploy_name)],
             ST_DEPLOY_PASS: [MessageHandler(filters.TEXT & ~filters.COMMAND, deploy_password)],
             ST_DEPLOY_ENV: [MessageHandler(filters.TEXT & ~filters.COMMAND, deploy_env)],
-            ST_DEPLOY_CONFIRM: [CallbackQueryHandler(deploy_confirm_callback, pattern="^deploy_")]
+            ST_DEPLOY_CONFIRM: [CallbackQueryHandler(deploy_confirm_callback, pattern="^deploy_")],
         },
         fallbacks=[CommandHandler("cancel", cmd_cancel)],
-        map_to_parent={ConversationHandler.END: ST_IDLE}
+        map_to_parent={ConversationHandler.END: ST_IDLE},
     )
 
     env_conv = ConversationHandler(
         entry_points=[CallbackQueryHandler(callback_router, pattern="^act_env_")],
         states={ST_ENV_EDIT: [MessageHandler(filters.TEXT & ~filters.COMMAND, env_edit_handler)]},
-        fallbacks=[CommandHandler("cancel", cmd_cancel)]
+        fallbacks=[CommandHandler("cancel", cmd_cancel)],
     )
 
     broadcast_conv = ConversationHandler(
         entry_points=[CallbackQueryHandler(callback_router, pattern="^admin_broadcast$")],
         states={ST_BROADCAST: [MessageHandler(filters.TEXT & ~filters.COMMAND, broadcast_handler)]},
-        fallbacks=[CommandHandler("cancel", cmd_cancel)]
+        fallbacks=[CommandHandler("cancel", cmd_cancel)],
     )
 
     application.add_handler(CommandHandler("start", cmd_start))
@@ -1629,8 +1716,16 @@ def main():
         name="process-auto-heal-watchdog",
     )
 
-    logger.info("🤖 ULTIMATE HOSTING BOT v4.0 STARTED with %s plugins", len([p for p in plugin_manager.loaded if p.enabled]))
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
+    logger.info(
+        "Starting Telegram worker with %s plugins",
+        len([plugin for plugin in plugin_manager.loaded if plugin.enabled]),
+    )
+    health_server.start()
+    try:
+        application.run_polling(allowed_updates=Update.ALL_TYPES)
+    finally:
+        health_server.set_ready(False)
+        health_server.stop()
 
 if __name__ == "__main__":
     main()

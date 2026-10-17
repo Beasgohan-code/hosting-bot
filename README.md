@@ -1,19 +1,19 @@
 # Hosting Bot
 
-Hosting Bot is a small deployment control plane for the existing Telegram hosting worker. It now includes a TypeScript/Express service, a Vite + React dashboard, and a persistent JSON service registry for local or single-instance deployments.
+Hosting Bot includes a TypeScript/Express control plane, a Vite + React dashboard, and a Telegram worker. The dashboard reports real control-plane process telemetry and real public HTTP monitor results; it does not invent sample services, deployment states, resource usage, or activity.
 
-> The dashboard is intentionally honest about its boundary: it manages the service registry and deployment lifecycle today, while repository execution belongs behind an isolated runner. This keeps the control plane safe to deploy before adding a privileged build sandbox.
+> Repository deployments are not enabled in the dashboard. A restricted isolated runner is required before arbitrary builds, start/stop controls, deployment history, or per-service resource metrics can be reported safely. Until one is configured, those operations are not presented as real.
 
 ## What is included
 
 | Layer | Implementation | Responsibility |
 | --- | --- | --- |
-| Dashboard | React, Vite, Three.js, anime.js | Service overview, deploy flow, activity, status controls, detail drawer |
-| API | TypeScript, Express, Zod | Health checks, service CRUD, start/stop, redeploy lifecycle |
-| Persistence | `data/services.json` | Local registry and activity timeline; replace with Postgres when multi-user auth is added |
+| Dashboard | React, Vite, Three.js, anime.js | Live endpoint health, real process telemetry, monitor history, and recorded activity |
+| API | TypeScript, Express, Zod | Control-plane health, process metrics, SSRF-safe monitor management, and Server-Sent Events |
+| Persistence | `data/monitoring.json` | Single-instance keep-alive monitors and real monitor activity; migrated from the old demo registry file |
 | Telegram worker | Python bot + plugin runtime | Telegram-native deployment management, logs, circuit-breaker auto-healing, and public endpoint monitors with Telegram alerts |
 | Keep-alive API | Express scheduler + JSON registry | Scheduled HTTP probes, latency/status history, pause/resume, manual checks, and SSRF-safe public target validation |
-| Deployment | Docker + `render.yaml` | Separate always-on web control plane and Telegram worker services |
+| Deployment | Docker Compose + `render.yaml` | Self-hosted control plane and Telegram worker; a repository deployment runner is not included |
 
 ## Local development
 
@@ -31,23 +31,22 @@ npm run build
 NODE_ENV=production PORT=8787 npm start
 ```
 
-The service API exposes:
+The API exposes these working control-plane and monitoring routes:
 
 | Method | Route | Purpose |
 | --- | --- | --- |
-| `GET` | `/api/health` | Render health check |
-| `GET` | `/api/overview` | Services, activity, and workspace metrics |
-| `POST` | `/api/services` | Queue a service deployment |
-| `PATCH` | `/api/services/:id/status` | Start or stop a service |
-| `POST` | `/api/services/:id/redeploy` | Start a new release cycle |
-| `DELETE` | `/api/services/:id` | Remove a service from the registry |
-| `GET` | `/api/keepalives` | List scheduled endpoint monitors |
-| `POST` | `/api/keepalives` | Create a public HTTP(S) keep-alive monitor |
+| `GET` | `/api/health` | Real process health, uptime, and RSS memory |
+| `GET` | `/api/overview` | Monitor readings, recorded events, and live process telemetry |
+| `GET` | `/api/events` | Server-Sent Events for real overview updates |
+| `GET` | `/api/keepalives` | List persisted public endpoint monitors |
+| `POST` | `/api/keepalives` | Validate and create a real HTTP(S) health monitor |
 | `PATCH` | `/api/keepalives/:id` | Pause or resume scheduled checks |
-| `POST` | `/api/keepalives/:id/check` | Run an immediate check and record the result |
+| `POST` | `/api/keepalives/:id/check` | Run a real immediate HTTP check and record its result |
 | `DELETE` | `/api/keepalives/:id` | Remove a monitor |
 
-Keep-alive checks run every minute or longer, store the latest 20 results per target, report latency and HTTP status, and broadcast state changes over the existing event stream. Targets are restricted to public HTTP(S) endpoints; private/local IPs, embedded credentials, query strings, and redirects are blocked to reduce SSRF risk. The Telegram worker exposes matching `/keepalive` commands and alerts the monitor owner when an endpoint transitions between healthy and failing.
+Requests to `/api/services` return `501` until an isolated deployment runner is configured. The dashboard no longer shows fake service records or offers simulated start, stop, or redeploy controls.
+
+Dashboard keep-alive checks run every minute or longer, store the latest 20 results per target, report latency and HTTP status, and broadcast state changes over the event stream. Targets are restricted to public HTTP(S) endpoints; private/local IPs, embedded credentials, query strings, and redirects are blocked to reduce SSRF risk. The Telegram worker has its own separate `/keepalive` monitor store and sends alerts for monitors created through Telegram; the two stores are not synchronized.
 
 ## Telegram worker configuration
 
@@ -57,21 +56,48 @@ The Python worker now reads secrets from the environment. Set `BOT_TOKEN` and a 
 BOT_TOKEN=123456:replace-me ADMIN_IDS=123456789 python ultimate_hosting_bot_fixed.py
 ```
 
-Do not commit tokens, cookies, or a populated `hosting_data` directory.
+Do not commit tokens, cookies, or a populated `hosting_data` directory. The worker's container health endpoint is available at `/livez`, `/readyz`, and `/healthz` on port `8788`; readiness becomes healthy only after the Telegram application and plugins have started. Configure `HEALTH_HOST` and `HEALTH_PORT` only if you need to change the defaults.
+
+## Docker Compose deployment
+
+The Compose stack runs the API/dashboard control plane and the Telegram worker as separate, non-root containers. It includes image-level and Compose health checks, graceful-stop windows, restart policies, read-only root filesystems, dropped Linux capabilities, bounded JSON logs, and named volumes for persistent application data.
+
+1. Install Docker Engine with the Compose v2 plugin, then create your local environment file:
+
+   ```bash
+   cp .env.example .env
+   ```
+
+2. Edit `.env` and set `BOT_TOKEN` and `ADMIN_IDS` for the Telegram worker. Keep `.env` private; it is excluded from both Git and the Docker build context.
+3. Build and start the stack:
+
+   ```bash
+   docker compose up --build -d
+   docker compose ps
+   docker compose logs -f
+   ```
+
+4. Open `http://localhost:8787` (or the host port set with `DASHBOARD_PORT`). The control-plane API is exposed on that same port; the worker's health port is internal to the Compose network and is not published publicly.
+
+The control plane's health endpoint is `GET /api/health`. The Telegram worker's readiness endpoint is `GET /readyz` on container port `8788`. Health status is visible with `docker compose ps`; inspect a service with `docker compose logs -f control-plane` or `docker compose logs -f telegram-worker`. To stop the stack without removing state, run `docker compose down`. The named volumes `control-plane-data` and `telegram-worker-data` preserve monitor state, the worker SQLite database, logs, backups, and hosted repositories across rebuilds. **Do not use `docker compose down -v` unless you intend to permanently delete that data.** Back up these volumes before maintenance or migration.
+
+The Node image is multi-stage and installs only API runtime dependencies in its final layer. The Python worker installs the project's application requirements at image build time. Update the project files and rebuild with `docker compose up --build -d`; changes to Python requirements also require rebuilding the worker image. If port `8787` is already in use, set `DASHBOARD_PORT` in `.env` to another host port. Never publish the Telegram health port or put a real bot token in the Compose file or image.
+
+The worker runs hosted repositories as an unprivileged user, but a container is not a full security boundary for executing arbitrary untrusted code. For multi-user/public hosting, isolate user deployments in separate restricted runner containers/VMs with resource limits, no shared secrets, and a queue-backed deployment service.
 
 ## Render deployment
 
-The included `render.yaml` creates two services: a Node web service named `hosting-bot-control-plane` and a Docker worker named `hosting-bot-telegram-worker`. Set the `BOT_TOKEN` and `ADMIN_IDS` environment variables in the Render dashboard. Keep both the control plane and the Telegram worker on an always-on host for their schedulers. For real arbitrary repository builds, attach a separate isolated runner and replace the lifecycle simulation in `server/index.ts` with a queue-backed runner adapter.
+The included `render.yaml` creates two services: a Node web service named `hosting-bot-control-plane` and a Docker worker named `hosting-bot-telegram-worker`. Set `BOT_TOKEN` and `ADMIN_IDS` in the Render dashboard. Keep both services on an always-on host for their schedulers. Repository deployments remain disabled until a separate isolated runner is integrated; no deployment success is fabricated by the control plane.
 
 ## Vercel deployment
 
-`vercel.json` configures a Vite static build for the dashboard. Connect this repository to Vercel and set `VITE_DEMO_MODE=true` for a standalone static preview. To connect a persistent API instead, set `VITE_API_BASE_URL` to its origin and configure the API's `CORS_ORIGIN` with the exact Vercel dashboard origin(s). The dashboard uses a clear preview/offline status until the API is reachable.
+`vercel.json` configures a static dashboard build. The dashboard never switches to demo data: without a reachable control-plane API it displays an offline state and empty/unavailable readings. To connect a persistent API, set `VITE_API_BASE_URL` to its origin and configure the API's `CORS_ORIGIN` with the exact Vercel dashboard origin(s).
 
-Vercel is suitable for the static dashboard, but it cannot keep the Telegram polling worker or the in-process keep-alive scheduler running continuously. The Python worker and scheduled monitor API must run on Render, a VPS, or another persistent service. The current file-backed JSON registry is intentionally single-instance and is not a serverless database.
+Vercel can host the static dashboard, but it cannot keep the Telegram polling worker or the in-process keep-alive scheduler running continuously. Run the Python worker and scheduled monitor API on Render, a VPS, or another persistent host. The file-backed `data/monitoring.json` store is intentionally single-instance and is not a serverless database.
 
 ## Next production steps
 
-The current implementation is a durable single-instance control plane rather than a multi-tenant PaaS. The next hardening steps are authenticated users and teams, Postgres-backed service state, Redis-backed deployment jobs, signed GitHub webhooks, per-service isolated containers, resource quotas, and log streaming over Server-Sent Events or WebSockets.
+The current implementation is a durable single-instance monitor control plane rather than a multi-tenant PaaS. The next hardening steps are authenticated users and teams, Postgres-backed monitor state, an isolated deployment runner with queue-backed jobs, signed GitHub webhooks, per-tenant resource quotas, and deployment-log streaming over Server-Sent Events or WebSockets.
 
 ## Telegram plugin system
 
@@ -109,8 +135,8 @@ def create_plugin():
 
 The runtime isolates import and lifecycle failures, exposes a stable `PluginContext` containing the config, database, process manager, log streamer, and UI factory, and reports extension health through `/health`. Privileged plugins must perform their own user checks; the built-in admin plugin demonstrates the expected pattern.
 
-## Live dashboard visualization
+## Live dashboard telemetry
 
-The web dashboard now includes a live infrastructure topology on the Overview page. The Three.js scene renders the control plane as a central hub with service nodes, connection lines, runtime-colored halos, hover states, and clickable labels that open the existing service drawer. Anime.js handles node entrance, selection, and rotation transitions while respecting the dashboard’s reduced-motion styling.
+The dashboard's Overview page displays actual monitored-target status, probe success rate from recorded checks, Node process RSS, process uptime, and API request counts. Values remain unavailable until the API responds; there are no seeded services, sample events, simulated build results, or fabricated per-service resource numbers.
 
-The browser subscribes to `GET /api/events` using Server-Sent Events. Every service mutation broadcasts a fresh overview payload containing services, activity, and metrics, so start, stop, deploy, redeploy, and delete actions appear without a manual refresh. The existing periodic fetch remains as a lightweight fallback if the stream is unavailable.
+The browser subscribes to `GET /api/events` using Server-Sent Events and polls the API every 15 seconds as a fallback. Events are written only when real monitor configuration or check results change. Repository deployment screens and controls are intentionally omitted until a restricted runner can provide real build and runtime data.

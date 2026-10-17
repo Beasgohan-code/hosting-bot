@@ -1,0 +1,87 @@
+name: hosting-bot
+
+services:
+  control-plane:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: hosting-bot-control-plane:local
+    restart: unless-stopped
+    init: true
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=16m
+    ports:
+      - "${DASHBOARD_PORT:-8787}:8787"
+    environment:
+      NODE_ENV: production
+      PORT: "8787"
+      DATA_DIR: /var/lib/hosting-bot
+      KEEPALIVE_TICK_MS: "${KEEPALIVE_TICK_MS:-15000}"
+      CORS_ORIGIN: "${CORS_ORIGIN:-}"
+    volumes:
+      - control-plane-data:/var/lib/hosting-bot
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - "fetch('http://127.0.0.1:8787/api/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+      interval: 30s
+      timeout: 3s
+      start_period: 15s
+      retries: 3
+    stop_grace_period: 15s
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
+
+  telegram-worker:
+    build:
+      context: .
+      dockerfile: Dockerfile.bot
+    image: hosting-bot-telegram-worker:local
+    restart: unless-stopped
+    init: true
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=32m
+    env_file:
+      - .env
+    environment:
+      HEALTH_HOST: "${HEALTH_HOST:-0.0.0.0}"
+      HEALTH_PORT: "${HEALTH_PORT:-8788}"
+    expose:
+      - "8788"
+    volumes:
+      - telegram-worker-data:/app/hosting_data
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import os,urllib.request; urllib.request.urlopen('http://127.0.0.1:%s/readyz' % os.environ.get('HEALTH_PORT', '8788'), timeout=2)"
+      interval: 30s
+      timeout: 3s
+      start_period: 45s
+      retries: 3
+    stop_grace_period: 30s
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
+
+volumes:
+  control-plane-data:
+  telegram-worker-data:

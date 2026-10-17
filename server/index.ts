@@ -16,36 +16,17 @@ import {
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const rootDir = path.resolve(__dirname, "..");
 const dataDir = path.resolve(process.env.DATA_DIR ?? path.join(rootDir, "data"));
-const dataFile = path.join(dataDir, "services.json");
+const dataFile = path.join(dataDir, "monitoring.json");
+const legacyDataFile = path.join(dataDir, "services.json");
 const port = Number(process.env.PORT ?? 8787);
 const monitorTickMs = Math.max(5_000, Number(process.env.KEEPALIVE_TICK_MS ?? 15_000));
 
-type ServiceStatus = "live" | "building" | "stopped" | "failed";
-type Runtime = "Node.js" | "Python" | "Docker";
 type KeepAliveStatus = "pending" | "up" | "down" | "paused";
-
-type Service = {
-  id: string;
-  name: string;
-  repoUrl: string;
-  branch: string;
-  runtime: Runtime;
-  region: string;
-  status: ServiceStatus;
-  url: string;
-  lastDeploy: string;
-  createdAt: string;
-  updatedAt: string;
-  buildTime: string;
-  cpu: number;
-  memory: number;
-  description: string;
-};
 
 type Activity = {
   id: string;
-  serviceId: string;
-  serviceName: string;
+  targetId: string;
+  targetName: string;
   action: string;
   detail: string;
   createdAt: string;
@@ -79,16 +60,6 @@ type KeepAliveMonitor = {
   history: MonitorCheck[];
 };
 
-const serviceInput = z.object({
-  name: z.string().trim().min(2).max(40),
-  repoUrl: z.string().trim().url(),
-  branch: z.string().trim().min(1).max(80).default("main"),
-  runtime: z.enum(["Node.js", "Python", "Docker"]).default("Node.js"),
-  region: z.string().trim().min(2).max(60).default("Singapore (southeast-1)"),
-  description: z.string().trim().max(120).default("Managed by Hosting Bot"),
-});
-
-const statusInput = z.object({ status: z.enum(["live", "stopped"]) });
 const keepAliveInput = z.object({
   name: z.string().trim().min(2).max(48).optional(),
   url: z.string().trim().min(1).max(2048),
@@ -96,26 +67,17 @@ const keepAliveInput = z.object({
 });
 const keepAlivePatchInput = z.object({ enabled: z.boolean() });
 
-let services: Service[] = [];
 let activities: Activity[] = [];
 let keepAlives: KeepAliveMonitor[] = [];
 let requestCount = 0;
 let persistQueue: Promise<void> = Promise.resolve();
 let monitorSweepRunning = false;
+let shuttingDown = false;
+let shutdownPromise: Promise<void> | null = null;
 const monitorChecksInFlight = new Set<string>();
-const deploymentTimers = new Map<string, NodeJS.Timeout>();
 const eventClients = new Set<Response>();
 
 const now = () => new Date().toISOString();
-
-function publicService(service: Service) {
-  return {
-    ...service,
-    lastDeploy: new Date(service.lastDeploy).getTime(),
-    createdAt: new Date(service.createdAt).getTime(),
-    updatedAt: new Date(service.updatedAt).getTime(),
-  };
-}
 
 function publicMonitor(monitor: KeepAliveMonitor) {
   const lastChecked = monitor.lastCheckedAt ? new Date(monitor.lastCheckedAt).getTime() : null;
@@ -131,23 +93,27 @@ function publicMonitor(monitor: KeepAliveMonitor) {
 }
 
 function overviewPayload() {
-  const live = services.filter((service) => service.status === "live").length;
-  const building = services.filter((service) => service.status === "building").length;
-  const memory = services.reduce((sum, service) => sum + service.memory, 0);
-  const checkCount = keepAlives.reduce((sum, monitor) => sum + monitor.successCount + monitor.failureCount, 0);
-  const successCount = keepAlives.reduce((sum, monitor) => sum + monitor.successCount, 0);
-  const uptime = checkCount ? `${((successCount / checkCount) * 100).toFixed(2)}%` : "—";
+  const activeMonitors = keepAlives.filter((monitor) => monitor.enabled).length;
+  const healthyMonitors = keepAlives.filter((monitor) => monitor.enabled && monitor.status === "up").length;
+  const failingMonitors = keepAlives.filter((monitor) => monitor.enabled && monitor.status === "down").length;
+  const totalChecks = keepAlives.reduce((sum, monitor) => sum + monitor.successCount + monitor.failureCount, 0);
+  const successfulChecks = keepAlives.reduce((sum, monitor) => sum + monitor.successCount, 0);
+  const probeSuccessRate = totalChecks
+    ? Number(((successfulChecks / totalChecks) * 100).toFixed(2))
+    : null;
   return {
-    services: services.map(publicService),
     activities: [...activities],
     keepAlives: keepAlives.map(publicMonitor),
     metrics: {
-      live,
-      building,
-      total: services.length,
-      memory,
-      uptime,
-      requests: requestCount.toLocaleString("en-US"),
+      totalMonitors: keepAlives.length,
+      activeMonitors,
+      healthyMonitors,
+      failingMonitors,
+      totalChecks,
+      probeSuccessRate,
+      processMemoryMb: Math.round(process.memoryUsage().rss / 1_048_576),
+      uptimeSeconds: Math.floor(process.uptime()),
+      apiRequests: requestCount,
     },
   };
 }
@@ -164,7 +130,7 @@ function broadcastOverview() {
 }
 
 function persist() {
-  const snapshot = JSON.stringify({ services, activities, keepAlives }, null, 2);
+  const snapshot = JSON.stringify({ activities, keepAlives }, null, 2);
   persistQueue = persistQueue.catch(() => undefined).then(async () => {
     await fs.mkdir(dataDir, { recursive: true });
     const tempFile = `${dataFile}.${process.pid}.tmp`;
@@ -181,121 +147,63 @@ async function load() {
     content = await fs.readFile(dataFile, "utf8");
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-    const created = now();
-    services = [
-      {
-        id: "svc_gateway",
-        name: "telegram-gateway",
-        repoUrl: "https://github.com/Beasgohan-code/hosting-bot",
-        branch: "main",
-        runtime: "Python",
-        region: "Singapore (southeast-1)",
-        status: "live",
-        url: "telegram-gateway.hosting.bot",
-        lastDeploy: new Date(Date.now() - 1000 * 60 * 18).toISOString(),
-        createdAt: created,
-        updatedAt: created,
-        buildTime: "42s",
-        cpu: 12,
-        memory: 148,
-        description: "Telegram worker with auto-healing and log streaming",
-      },
-      {
-        id: "svc_dashboard",
-        name: "dashboard-api",
-        repoUrl: "https://github.com/Beasgohan-code/hosting-bot",
-        branch: "main",
-        runtime: "Node.js",
-        region: "Singapore (southeast-1)",
-        status: "live",
-        url: "dashboard-api.hosting.bot",
-        lastDeploy: new Date(Date.now() - 1000 * 60 * 47).toISOString(),
-        createdAt: created,
-        updatedAt: created,
-        buildTime: "31s",
-        cpu: 7,
-        memory: 96,
-        description: "TypeScript control plane API",
-      },
-      {
-        id: "svc_landing",
-        name: "landing-preview",
-        repoUrl: "https://github.com/Beasgohan-code/hosting-bot",
-        branch: "redesign",
-        runtime: "Node.js",
-        region: "Frankfurt (eu-central-1)",
-        status: "stopped",
-        url: "landing-preview.hosting.bot",
-        lastDeploy: new Date(Date.now() - 1000 * 60 * 60 * 8).toISOString(),
-        createdAt: created,
-        updatedAt: created,
-        buildTime: "28s",
-        cpu: 0,
-        memory: 0,
-        description: "Preview environment for the dashboard refresh",
-      },
-    ];
-    activities = [
-      { id: randomUUID(), serviceId: "svc_gateway", serviceName: "telegram-gateway", action: "Deployment succeeded", detail: "Build completed in 42s", createdAt: new Date(Date.now() - 1000 * 60 * 18).toISOString(), tone: "success" },
-      { id: randomUUID(), serviceId: "svc_dashboard", serviceName: "dashboard-api", action: "Deployment succeeded", detail: "v1.4.0 is live", createdAt: new Date(Date.now() - 1000 * 60 * 47).toISOString(), tone: "success" },
-      { id: randomUUID(), serviceId: "svc_landing", serviceName: "landing-preview", action: "Service stopped", detail: "Manual action from dashboard", createdAt: new Date(Date.now() - 1000 * 60 * 79).toISOString(), tone: "warning" },
-      { id: randomUUID(), serviceId: "svc_gateway", serviceName: "telegram-gateway", action: "Health check passed", detail: "Latency 84ms", createdAt: new Date(Date.now() - 1000 * 60 * 96).toISOString(), tone: "info" },
-    ];
-    keepAlives = [];
-    await persist();
-    return;
+    try {
+      content = await fs.readFile(legacyDataFile, "utf8");
+    } catch (legacyError) {
+      if ((legacyError as NodeJS.ErrnoException).code !== "ENOENT") throw legacyError;
+      activities = [];
+      keepAlives = [];
+      await persist();
+      return;
+    }
   }
 
   const parsed = JSON.parse(content) as {
-    services?: Service[];
-    activities?: Activity[];
+    activities?: Array<Partial<Activity> & { serviceId?: string; serviceName?: string }>;
     keepAlives?: KeepAliveMonitor[];
   };
-  services = parsed.services ?? [];
-  activities = parsed.activities ?? [];
-  keepAlives = parsed.keepAlives ?? [];
+  keepAlives = Array.isArray(parsed.keepAlives) ? parsed.keepAlives : [];
 
-  // A deploy simulation cannot survive a process restart; don't leave stale jobs
-  // appearing to build forever after a server restart.
-  let interruptedDeployment = false;
-  for (const service of services) {
-    if (service.status === "building") {
-      service.status = "failed";
-      service.updatedAt = now();
-      interruptedDeployment = true;
-      activity(service, "Deployment interrupted", "Control plane restarted while this release was building", "warning");
-    }
+  // Keep real monitor history but discard the old fabricated service/deployment
+  // records from previous dashboard versions.
+  activities = (Array.isArray(parsed.activities) ? parsed.activities : []).flatMap((entry) => {
+    const targetId = entry.targetId ?? entry.serviceId;
+    if (!targetId?.startsWith("mon_") || typeof entry.action !== "string") return [];
+    const tone = entry.tone === "success" || entry.tone === "warning" ? entry.tone : "info";
+    return [{
+      id: typeof entry.id === "string" ? entry.id : randomUUID(),
+      targetId,
+      targetName: typeof entry.targetName === "string"
+        ? entry.targetName
+        : typeof entry.serviceName === "string" ? entry.serviceName : "Monitor",
+      action: entry.action,
+      detail: typeof entry.detail === "string" ? entry.detail : "",
+      createdAt: typeof entry.createdAt === "string" ? entry.createdAt : now(),
+      tone,
+    }];
+  });
+
+  // Write the cleaned schema, preserving real monitors but removing all former
+  // demo services and simulated deployment history.
+  await persist();
+  try {
+    await fs.unlink(legacyDataFile);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
   }
-  if (interruptedDeployment) await persist();
-}
-
-function activity(service: Pick<Service, "id" | "name">, action: string, detail: string, tone: Activity["tone"] = "info") {
-  activities.unshift({ id: randomUUID(), serviceId: service.id, serviceName: service.name, action, detail, createdAt: now(), tone });
-  activities = activities.slice(0, 50);
 }
 
 function activityForMonitor(monitor: KeepAliveMonitor, action: string, detail: string, tone: Activity["tone"] = "info") {
-  activities.unshift({ id: randomUUID(), serviceId: monitor.id, serviceName: monitor.name, action, detail, createdAt: now(), tone });
+  activities.unshift({
+    id: randomUUID(),
+    targetId: monitor.id,
+    targetName: monitor.name,
+    action,
+    detail,
+    createdAt: now(),
+    tone,
+  });
   activities = activities.slice(0, 50);
-}
-
-function clearDeploymentTimer(id: string) {
-  const timer = deploymentTimers.get(id);
-  if (timer) clearTimeout(timer);
-  deploymentTimers.delete(id);
-}
-
-async function finishDeployment(id: string) {
-  const service = services.find((entry) => entry.id === id);
-  if (!service || service.status !== "building") return;
-  service.status = "live";
-  service.buildTime = `${Math.floor(24 + Math.random() * 28)}s`;
-  service.cpu = Math.floor(4 + Math.random() * 10);
-  service.memory = Math.floor(72 + Math.random() * 80);
-  service.updatedAt = now();
-  activity(service, "Deployment succeeded", `${service.name} is live at ${service.url}`, "success");
-  clearDeploymentTimer(id);
-  await persist();
 }
 
 async function checkMonitor(monitor: KeepAliveMonitor, source: "scheduled" | "manual" = "scheduled") {
@@ -372,6 +280,12 @@ app.use((req, _res, next) => {
   if (req.path.startsWith("/api/") && req.path !== "/api/events") requestCount += 1;
   next();
 });
+app.use((req, res, next) => {
+  if (shuttingDown && req.path.startsWith("/api/")) {
+    return res.status(503).json({ error: "Control plane is shutting down" });
+  }
+  next();
+});
 
 app.get("/api/health", (_req, res) => {
   const monitored = keepAlives.length;
@@ -382,6 +296,7 @@ app.get("/api/health", (_req, res) => {
     timestamp: now(),
     uptimeSeconds: Math.floor(process.uptime()),
     keepAlive: { monitored, failing },
+    processMemoryMb: Math.round(process.memoryUsage().rss / 1_048_576),
   });
 });
 
@@ -480,78 +395,16 @@ app.delete("/api/keepalives/:id", async (req: Request, res: Response) => {
   res.status(204).send();
 });
 
-app.post("/api/services", async (req: Request, res: Response) => {
-  const parsed = serviceInput.safeParse(req.body);
-  if (!parsed.success) return res.status(400).json({ error: "Invalid service details", issues: parsed.error.issues });
-  const input = parsed.data;
-  const created = now();
-  const id = `svc_${randomUUID().slice(0, 8)}`;
-  const service: Service = {
-    id,
-    name: input.name,
-    repoUrl: input.repoUrl,
-    branch: input.branch,
-    runtime: input.runtime,
-    region: input.region,
-    status: "building",
-    url: `${input.name.toLowerCase().replace(/[^a-z0-9]+/g, "-")}.hosting.bot`,
-    lastDeploy: created,
-    createdAt: created,
-    updatedAt: created,
-    buildTime: "—",
-    cpu: 0,
-    memory: 0,
-    description: input.description,
-  };
-  services.unshift(service);
-  activity(service, "Deployment queued", `Building ${input.branch} from ${input.repoUrl}`, "info");
-  await persist();
-  const timer = setTimeout(() => void finishDeployment(id).catch((error) => console.error("[hosting-bot] deployment completion failed", error)), 1_600);
-  timer.unref();
-  deploymentTimers.set(id, timer);
-  res.status(201).json(publicService(service));
-});
+app.use("/api/services", (_req, res) => res.status(501).json({
+  error: "Deployments are unavailable because no isolated deployment runner is configured.",
+}));
 
-app.patch("/api/services/:id/status", async (req: Request, res: Response) => {
-  const parsed = statusInput.safeParse(req.body);
-  const service = services.find((entry) => entry.id === req.params.id);
-  if (!service) return res.status(404).json({ error: "Service not found" });
-  if (!parsed.success) return res.status(400).json({ error: "Invalid status" });
-  if (parsed.data.status === "stopped") clearDeploymentTimer(service.id);
-  service.status = parsed.data.status;
-  service.cpu = service.status === "live" ? Math.max(4, service.cpu) : 0;
-  service.memory = service.status === "live" ? Math.max(72, service.memory) : 0;
-  service.updatedAt = now();
-  activity(service, service.status === "live" ? "Service started" : "Service stopped", "Manual action from dashboard", service.status === "live" ? "success" : "warning");
-  await persist();
-  res.json(publicService(service));
-});
-
-app.post("/api/services/:id/redeploy", async (req: Request, res: Response) => {
-  const service = services.find((entry) => entry.id === req.params.id);
-  if (!service) return res.status(404).json({ error: "Service not found" });
-  clearDeploymentTimer(service.id);
-  service.status = "building";
-  service.updatedAt = now();
-  activity(service, "Redeploy started", `Pulling ${service.branch} and preparing a new release`, "info");
-  await persist();
-  const timer = setTimeout(() => void finishDeployment(service.id).catch((error) => console.error("[hosting-bot] deployment completion failed", error)), 1_800);
-  timer.unref();
-  deploymentTimers.set(service.id, timer);
-  res.json(publicService(service));
-});
-
-app.delete("/api/services/:id", async (req, res) => {
-  const index = services.findIndex((entry) => entry.id === req.params.id);
-  if (index === -1) return res.status(404).json({ error: "Service not found" });
-  const [removed] = services.splice(index, 1);
-  clearDeploymentTimer(req.params.id);
-  if (removed) activity(removed, "Service removed", "Removed from the project registry", "warning");
-  await persist();
-  res.status(204).send();
-});
+app.use("/api", (_req, res) => res.status(404).json({ error: "API route not found" }));
 
 app.use((error: unknown, _req: Request, res: Response, _next: express.NextFunction) => {
+  if (error instanceof SyntaxError && "status" in error && error.status === 400) {
+    return res.status(400).json({ error: "Malformed JSON request body" });
+  }
   console.error("[hosting-bot] request failed", error);
   res.status(500).json({ error: "Internal control-plane error" });
 });
@@ -565,4 +418,46 @@ if (process.env.NODE_ENV === "production") {
 await load();
 const monitorInterval = setInterval(() => void runScheduledMonitorChecks(), monitorTickMs);
 monitorInterval.unref();
-app.listen(port, "0.0.0.0", () => console.log(`[hosting-bot] control plane listening on :${port}`));
+const httpServer = app.listen(port, "0.0.0.0", () => {
+  httpServer.keepAliveTimeout = 5_000;
+  httpServer.headersTimeout = 10_000;
+  console.log(`[hosting-bot] control plane listening on :${port}`);
+});
+
+async function shutdown(signal: NodeJS.Signals) {
+  if (shutdownPromise) return shutdownPromise;
+  shuttingDown = true;
+  shutdownPromise = (async () => {
+    console.info(`[hosting-bot] received ${signal}; shutting down gracefully`);
+    clearInterval(heartbeat);
+    clearInterval(monitorInterval);
+    for (const client of eventClients) {
+      try {
+        client.end();
+      } catch {
+        // A disconnected browser is already gone.
+      }
+    }
+    eventClients.clear();
+
+    const forceCloseTimer = setTimeout(() => {
+      console.error("[hosting-bot] graceful shutdown timed out; closing open connections");
+      httpServer.closeAllConnections();
+    }, 12_000);
+    forceCloseTimer.unref();
+    const serverClosed = new Promise<void>((resolve) => httpServer.close(() => resolve()));
+
+    try {
+      await persist();
+    } catch (error) {
+      console.error("[hosting-bot] final persistence failed", error);
+    }
+    await serverClosed;
+    clearTimeout(forceCloseTimer);
+    console.info("[hosting-bot] shutdown complete");
+  })();
+  return shutdownPromise;
+}
+
+process.once("SIGTERM", () => void shutdown("SIGTERM"));
+process.once("SIGINT", () => void shutdown("SIGINT"));

@@ -14,14 +14,8 @@
     "test": "vitest run"
   },
   "dependencies": {
-    "@vitejs/plugin-react": "^5.0.4",
-    "animejs": "^4.2.2",
     "cors": "^2.8.5",
     "express": "^5.1.0",
-    "lucide-react": "^0.468.0",
-    "react": "^19.1.1",
-    "react-dom": "^19.1.1",
-    "three": "^0.180.0",
     "zod": "^4.1.12"
   },
   "devDependencies": {
@@ -32,8 +26,13 @@
     "@types/react-dom": "^19.1.6",
     "@types/three": "^0.185.4",
     "@vitejs/plugin-react": "^5.0.4",
+    "animejs": "^4.2.2",
     "concurrently": "^9.2.1",
     "esbuild": "^0.25.9",
+    "lucide-react": "^0.468.0",
+    "react": "^19.1.1",
+    "react-dom": "^19.1.1",
+    "three": "^0.180.0",
     "tsx": "^4.19.4",
     "typescript": "^5.9.2",
     "vite": "^7.1.7",

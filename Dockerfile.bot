@@ -1,10 +1,30 @@
-FROM python:3.11-slim
+FROM python:3.11-slim AS runtime
 
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PIP_NO_CACHE_DIR=1 \
+    HEALTH_HOST=0.0.0.0 \
+    HEALTH_PORT=8788
 WORKDIR /app
-RUN apt-get update && apt-get install -y --no-install-recommends git && rm -rf /var/lib/apt/lists/*
 
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
-COPY ultimate_hosting_bot_fixed.py .
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates git procps \
+    && rm -rf /var/lib/apt/lists/* \
+    && groupadd --gid 10001 bot \
+    && useradd --uid 10001 --gid bot --create-home --home-dir /home/bot --shell /usr/sbin/nologin bot \
+    && mkdir -p /app/hosting_data/logs /app/hosting_data/repos /app/hosting_data/backups \
+    && chown -R bot:bot /app /home/bot
 
-CMD ["python", "ultimate_hosting_bot_fixed.py"]
+COPY requirements.txt ./
+RUN pip install --disable-pip-version-check --no-cache-dir -r requirements.txt
+
+COPY --chown=bot:bot ultimate_hosting_bot_fixed.py ./
+COPY --chown=bot:bot bot_plugins ./bot_plugins
+
+USER bot:bot
+EXPOSE 8788
+STOPSIGNAL SIGTERM
+HEALTHCHECK --interval=30s --timeout=3s --start-period=30s --retries=3 \
+  CMD python -c "import os,urllib.request; urllib.request.urlopen('http://127.0.0.1:%s/readyz' % os.getenv('HEALTH_PORT', '8788'), timeout=2)"
+
+CMD ["python", "-u", "ultimate_hosting_bot_fixed.py"]

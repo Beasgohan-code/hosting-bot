@@ -1,207 +1,117 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, type ReactNode } from "react";
 import * as THREE from "three";
 import { animate, stagger } from "animejs";
 import {
   Activity,
   ArrowUpRight,
-  Box,
   Check,
-  ChevronDown,
-  CircleHelp,
   Clock3,
-  Cloud,
-  Code2,
-  Copy,
   Cpu,
-  Database,
-  ExternalLink,
-  Github,
-  GitBranch,
-  Globe2,
   HeartPulse,
-  Layers3,
   LayoutDashboard,
-  LifeBuoy,
-  LoaderCircle,
   Menu,
-  MoreHorizontal,
-  Pause,
-  Play,
   Plus,
   RefreshCw,
-  Rocket,
-  Search,
   Server,
-  Settings2,
   ShieldCheck,
-  Sparkles,
-  SquareTerminal,
-  Terminal,
-  Trash2,
-  TrendingUp,
-  Users,
-  X,
-  Zap,
 } from "lucide-react";
 import { KeepAliveModal, KeepAlivePage } from "./components/KeepAliveManager";
-import ServiceTopology from "./components/ServiceTopology";
-import type { ActivityItem, KeepAliveMonitor, Metrics, Runtime, Service, ServiceStatus } from "./types";
+import type { ActivityItem, KeepAliveMonitor, Metrics } from "./types";
 import "./styles.css";
 
 const API_BASE_URL = (import.meta.env.VITE_API_BASE_URL ?? "").trim().replace(/\/+$/, "");
-const isDemoMode = import.meta.env.VITE_DEMO_MODE === "true" && !API_BASE_URL;
 const apiPath = (route: string) => `${API_BASE_URL}${route}`;
-
-const fallbackServices: Service[] = [
-  { id: "svc_gateway", name: "telegram-gateway", repoUrl: "https://github.com/Beasgohan-code/hosting-bot", branch: "main", runtime: "Python", region: "Singapore (southeast-1)", status: "live", url: "telegram-gateway.hosting.bot", lastDeploy: Date.now() - 1080000, createdAt: Date.now(), updatedAt: Date.now(), buildTime: "42s", cpu: 12, memory: 148, description: "Telegram worker with auto-healing and log streaming" },
-  { id: "svc_dashboard", name: "dashboard-api", repoUrl: "https://github.com/Beasgohan-code/hosting-bot", branch: "main", runtime: "Node.js", region: "Singapore (southeast-1)", status: "live", url: "dashboard-api.hosting.bot", lastDeploy: Date.now() - 2820000, createdAt: Date.now(), updatedAt: Date.now(), buildTime: "31s", cpu: 7, memory: 96, description: "TypeScript control plane API" },
-  { id: "svc_landing", name: "landing-preview", repoUrl: "https://github.com/Beasgohan-code/hosting-bot", branch: "redesign", runtime: "Node.js", region: "Frankfurt (eu-central-1)", status: "stopped", url: "landing-preview.hosting.bot", lastDeploy: Date.now() - 28800000, createdAt: Date.now(), updatedAt: Date.now(), buildTime: "28s", cpu: 0, memory: 0, description: "Preview environment for the dashboard refresh" },
-];
+type ApiStatus = "connecting" | "online" | "offline";
+type OverviewPayload = { activities: ActivityItem[]; keepAlives: KeepAliveMonitor[]; metrics: Metrics };
 
 function App() {
-  const [services, setServices] = useState<Service[]>(fallbackServices);
   const [activities, setActivities] = useState<ActivityItem[]>([]);
   const [keepAlives, setKeepAlives] = useState<KeepAliveMonitor[]>([]);
-  const [metrics, setMetrics] = useState<Metrics>({ live: 2, building: 0, total: 3, memory: 244, uptime: "—", requests: "0" });
+  const [metrics, setMetrics] = useState<Metrics | null>(null);
   const [activeSection, setActiveSection] = useState("Overview");
-  const [showDeploy, setShowDeploy] = useState(false);
   const [showKeepAlive, setShowKeepAlive] = useState(false);
-  const [selected, setSelected] = useState<Service | null>(null);
-  const [query, setQuery] = useState("");
   const [notice, setNotice] = useState("");
+  const [apiStatus, setApiStatus] = useState<ApiStatus>("connecting");
   const [streamConnected, setStreamConnected] = useState(false);
-  const [apiOnline, setApiOnline] = useState(false);
   const [checkingMonitor, setCheckingMonitor] = useState<string | null>(null);
+  const [lastUpdatedAt, setLastUpdatedAt] = useState<number | null>(null);
+  const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
+  const noticeTimer = useRef<number | null>(null);
+
+  function applyOverview(data: OverviewPayload) {
+    setActivities(Array.isArray(data.activities) ? data.activities : []);
+    setKeepAlives(Array.isArray(data.keepAlives) ? data.keepAlives : []);
+    setMetrics(data.metrics);
+    setApiStatus("online");
+    setLastUpdatedAt(Date.now());
+  }
 
   async function refresh(): Promise<boolean> {
-    if (isDemoMode) {
-      setApiOnline(false);
-      return false;
-    }
     try {
-      const response = await fetch(apiPath("/api/overview"));
-      if (!response.ok) throw new Error("API unavailable");
-      const data = await response.json();
-      setServices(data.services);
-      setActivities(data.activities);
-      setKeepAlives(data.keepAlives ?? []);
-      setMetrics(data.metrics);
-      setApiOnline(true);
+      const response = await fetch(apiPath("/api/overview"), { cache: "no-store" });
+      if (!response.ok) throw new Error("Control-plane API unavailable");
+      const data = await response.json() as OverviewPayload;
+      applyOverview(data);
       return true;
     } catch {
-      setApiOnline(false);
+      setApiStatus("offline");
       return false;
     }
   }
 
   useEffect(() => {
-    if (isDemoMode) return;
-    let source: EventSource | null = null;
     let disposed = false;
-    void refresh().then((online) => {
-      if (!online || disposed) return;
+    let source: EventSource | null = null;
+
+    async function refreshAndConnect() {
+      const online = await refresh();
+      if (!online || disposed || source) return;
       source = new EventSource(apiPath("/api/events"));
       source.addEventListener("overview", (event) => {
         try {
-          const data = JSON.parse((event as MessageEvent).data) as { services: Service[]; activities: ActivityItem[]; keepAlives?: KeepAliveMonitor[]; metrics: Metrics };
-          setServices(data.services);
-          setActivities(data.activities);
-          setKeepAlives(data.keepAlives ?? []);
-          setMetrics(data.metrics);
-          setApiOnline(true);
+          applyOverview(JSON.parse((event as MessageEvent).data) as OverviewPayload);
           setStreamConnected(true);
         } catch {
           setStreamConnected(false);
         }
       });
       source.onopen = () => setStreamConnected(true);
-      source.onerror = () => { setStreamConnected(false); setApiOnline(false); };
-    });
-    return () => { disposed = true; source?.close(); };
+      source.onerror = () => setStreamConnected(false);
+    }
+
+    void refreshAndConnect();
+    const timer = window.setInterval(() => void refreshAndConnect(), 15_000);
+    return () => {
+      disposed = true;
+      window.clearInterval(timer);
+      source?.close();
+      if (noticeTimer.current !== null) window.clearTimeout(noticeTimer.current);
+    };
   }, []);
-  useEffect(() => {
-    if (isDemoMode) return;
-    const timer = window.setInterval(() => void refresh(), 15000);
-    return () => window.clearInterval(timer);
-  }, []);
+
   useEffect(() => {
     animate(".animate-in", { opacity: [0, 1], translateY: [12, 0], delay: stagger(55), duration: 520, ease: "outExpo" });
   }, [activeSection]);
 
-  const filteredServices = services.filter((service) => `${service.name} ${service.runtime} ${service.region}`.toLowerCase().includes(query.toLowerCase()));
-  const showNotice = (message: string) => { setNotice(message); window.setTimeout(() => setNotice(""), 2600); };
+  const apiOnline = apiStatus === "online";
+  const failingMonitors = keepAlives.filter((monitor) => monitor.enabled && monitor.status === "down").length;
+  const systemStatus = apiStatus === "connecting"
+    ? "Connecting to control plane"
+    : apiStatus === "offline"
+      ? "Control plane offline"
+      : failingMonitors > 0
+        ? `${failingMonitors} target${failingMonitors === 1 ? "" : "s"} failing`
+        : streamConnected ? "Live telemetry connected" : "API online · polling";
 
-  async function changeStatus(service: Service, status: "live" | "stopped") {
-    setServices((current) => current.map((item) => item.id === service.id ? { ...item, status, cpu: status === "live" ? Math.max(item.cpu, 5) : 0, memory: status === "live" ? Math.max(item.memory, 80) : 0 } : item));
-    if (!apiOnline) {
-      showNotice(`${service.name} updated in local preview`);
-      return;
-    }
-    try {
-      const response = await fetch(apiPath(`/api/services/${service.id}/status`), { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ status }) });
-      if (!response.ok) throw new Error("Status update failed");
-      await refresh();
-      showNotice(`${service.name} ${status === "live" ? "started" : "stopped"}`);
-    } catch {
-      setServices((current) => current.map((item) => item.id === service.id ? service : item));
-      showNotice(`Could not update ${service.name}`);
-    }
-  }
-
-  async function redeploy(service: Service) {
-    setServices((current) => current.map((item) => item.id === service.id ? { ...item, status: "building" } : item));
-    if (!apiOnline) {
-      window.setTimeout(() => setServices((current) => current.map((item) => item.id === service.id ? { ...item, status: "live", lastDeploy: Date.now() } : item)), 1600);
-      showNotice("Demo redeploy simulated locally");
-      return;
-    }
-    try {
-      const response = await fetch(apiPath(`/api/services/${service.id}/redeploy`), { method: "POST" });
-      if (!response.ok) throw new Error("Redeploy failed");
-    } catch {
-      setServices((current) => current.map((item) => item.id === service.id ? { ...item, status: "failed" } : item));
-      showNotice(`Could not redeploy ${service.name}`);
-      return;
-    }
-    showNotice(`Redeploying ${service.name}`);
-    window.setTimeout(() => void refresh(), 2200);
-  }
-
-  async function removeService(service: Service) {
-    setServices((current) => current.filter((item) => item.id !== service.id));
-    setSelected(null);
-    if (!apiOnline) {
-      showNotice(`${service.name} removed from local preview`);
-      return;
-    }
-    try {
-      const response = await fetch(apiPath(`/api/services/${service.id}`), { method: "DELETE" });
-      if (!response.ok) throw new Error("Remove failed");
-      showNotice(`${service.name} removed from project`);
-    } catch {
-      setServices((current) => [service, ...current]);
-      showNotice(`Could not remove ${service.name}`);
-    }
-  }
-
-  async function createService(payload: Record<string, string>) {
-    try {
-      if (!apiOnline) throw new Error("Preview mode");
-      const response = await fetch(apiPath("/api/services"), { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) });
-      if (response.ok) await refresh();
-      else throw new Error("Unable to create");
-    } catch {
-      const created: Service = { id: `local_${Date.now()}`, name: payload.name, repoUrl: payload.repoUrl, branch: payload.branch, runtime: payload.runtime as Runtime, region: payload.region, status: "building", url: `${payload.name}.hosting.bot`, lastDeploy: Date.now(), createdAt: Date.now(), updatedAt: Date.now(), buildTime: "—", cpu: 0, memory: 0, description: payload.description || "Managed by Hosting Bot" };
-      setServices((current) => [created, ...current]);
-      window.setTimeout(() => setServices((current) => current.map((item) => item.id === created.id ? { ...item, status: "live", buildTime: "34s", cpu: 6, memory: 96, lastDeploy: Date.now() } : item)), 1600);
-    }
-    setShowDeploy(false);
-    showNotice(apiOnline ? `${payload.name} is being deployed` : `${payload.name} added to this local preview`);
+  function showNotice(message: string) {
+    setNotice(message);
+    if (noticeTimer.current !== null) window.clearTimeout(noticeTimer.current);
+    noticeTimer.current = window.setTimeout(() => setNotice(""), 3000);
   }
 
   async function createKeepAlive(payload: { name: string; url: string; intervalMinutes: number }) {
     if (!apiOnline) {
-      showNotice("Keep-alive monitors need the persistent control-plane API.");
+      showNotice("The control-plane API is offline. No monitor was created.");
       return;
     }
     try {
@@ -212,25 +122,23 @@ function App() {
       });
       const result = await response.json();
       if (!response.ok) throw new Error(result.error || "Unable to create monitor");
-      setKeepAlives((current) => [result as KeepAliveMonitor, ...current]);
       setShowKeepAlive(false);
       showNotice(`Monitoring ${result.name}`);
-      void refresh();
+      await refresh();
     } catch (error) {
       showNotice(error instanceof Error ? error.message : "Could not add monitor");
     }
   }
 
   async function checkKeepAlive(monitor: KeepAliveMonitor) {
-    if (!apiOnline) return showNotice("Connect the persistent control-plane API to run checks.");
+    if (!apiOnline) return showNotice("The control-plane API is offline. No check was run.");
     setCheckingMonitor(monitor.id);
     try {
       const response = await fetch(apiPath(`/api/keepalives/${monitor.id}/check`), { method: "POST" });
       const result = await response.json();
       if (!response.ok) throw new Error(result.error || "Check failed");
-      setKeepAlives((current) => current.map((item) => item.id === monitor.id ? result as KeepAliveMonitor : item));
+      await refresh();
       showNotice(result.status === "up" ? `${monitor.name} is responding` : `${monitor.name} did not respond`);
-      void refresh();
     } catch (error) {
       showNotice(error instanceof Error ? error.message : "Check failed");
     } finally {
@@ -239,7 +147,7 @@ function App() {
   }
 
   async function toggleKeepAlive(monitor: KeepAliveMonitor, enabled: boolean) {
-    if (!apiOnline) return showNotice("Connect the persistent control-plane API to manage monitors.");
+    if (!apiOnline) return showNotice("The control-plane API is offline. No setting was changed.");
     try {
       const response = await fetch(apiPath(`/api/keepalives/${monitor.id}`), {
         method: "PATCH",
@@ -248,7 +156,7 @@ function App() {
       });
       const result = await response.json();
       if (!response.ok) throw new Error(result.error || "Unable to update monitor");
-      setKeepAlives((current) => current.map((item) => item.id === monitor.id ? result as KeepAliveMonitor : item));
+      await refresh();
       showNotice(`${monitor.name} ${enabled ? "resumed" : "paused"}`);
     } catch (error) {
       showNotice(error instanceof Error ? error.message : "Unable to update monitor");
@@ -256,62 +164,81 @@ function App() {
   }
 
   async function removeKeepAlive(monitor: KeepAliveMonitor) {
-    if (!apiOnline) return showNotice("Connect the persistent control-plane API to remove monitors.");
+    if (!apiOnline) return showNotice("The control-plane API is offline. No monitor was removed.");
     try {
       const response = await fetch(apiPath(`/api/keepalives/${monitor.id}`), { method: "DELETE" });
       if (!response.ok) throw new Error("Unable to remove monitor");
-      setKeepAlives((current) => current.filter((item) => item.id !== monitor.id));
+      await refresh();
       showNotice(`${monitor.name} removed`);
     } catch (error) {
       showNotice(error instanceof Error ? error.message : "Unable to remove monitor");
     }
   }
 
-  const failedMonitors = keepAlives.filter((monitor) => monitor.enabled && monitor.status === "down").length;
-  const systemStatus = isDemoMode
-    ? "Demo preview · API not connected"
-    : !apiOnline
-      ? "Control plane reconnecting"
-      : failedMonitors > 0
-        ? `${failedMonitors} monitor${failedMonitors === 1 ? "" : "s"} failing`
-        : "Control plane online";
+  function navigate(section: string) {
+    setActiveSection(section);
+    setMobileMenuOpen(false);
+  }
 
   return (
     <div className="app-shell">
       <AmbientScene />
-      <aside className="sidebar">
+      <aside className={`sidebar ${mobileMenuOpen ? "open" : ""}`}>
         <div className="brand"><div className="brand-mark"><span>H</span></div><div><strong>hosting<span className="accent">.</span>bot</strong><small>CONTROL PLANE</small></div></div>
-        <div className="workspace"><div className="workspace-icon">B</div><div><span>Workspace</span><strong>Beasgohan labs</strong></div><ChevronDown size={14} /></div>
+        <div className="workspace"><div className="workspace-icon"><Server size={14} /></div><div><span>INSTANCE</span><strong>Hosting Bot</strong></div></div>
         <nav className="nav-list">
-          <span className="nav-label">OPERATIONS</span>
-          <NavItem icon={<LayoutDashboard size={16} />} label="Overview" active={activeSection === "Overview"} onClick={() => setActiveSection("Overview")} />
-          <NavItem icon={<Server size={16} />} label="Services" count={services.length} active={activeSection === "Services"} onClick={() => setActiveSection("Services")} />
-          <NavItem icon={<Rocket size={16} />} label="Deployments" active={activeSection === "Deployments"} onClick={() => setActiveSection("Deployments")} />
-          <NavItem icon={<Activity size={16} />} label="Activity" active={activeSection === "Activity"} onClick={() => setActiveSection("Activity")} />
-          <NavItem icon={<HeartPulse size={16} />} label="Keep-alive" count={keepAlives.length} active={activeSection === "Keep-alive"} onClick={() => setActiveSection("Keep-alive")} />
-          <span className="nav-label nav-spacer">CONFIGURATION</span>
-          <NavItem icon={<Database size={16} />} label="Environment" active={activeSection === "Environment"} onClick={() => setActiveSection("Environment")} />
-          <NavItem icon={<ShieldCheck size={16} />} label="Access & teams" active={activeSection === "Access & teams"} onClick={() => setActiveSection("Access & teams")} />
-          <NavItem icon={<Settings2 size={16} />} label="Settings" active={activeSection === "Settings"} onClick={() => setActiveSection("Settings")} />
+          <span className="nav-label">MONITORING</span>
+          <NavItem icon={<LayoutDashboard size={16} />} label="Overview" active={activeSection === "Overview"} onClick={() => navigate("Overview")} />
+          <NavItem icon={<HeartPulse size={16} />} label="Keep-alive" count={keepAlives.length} active={activeSection === "Keep-alive"} onClick={() => navigate("Keep-alive")} />
+          <NavItem icon={<Activity size={16} />} label="Activity" active={activeSection === "Activity"} onClick={() => navigate("Activity")} />
         </nav>
-        <div className="sidebar-bottom"><div className="plan-card"><div className="plan-top"><span className="plan-dot" /> Free workspace <span>·</span> <span className="mono">v1.4</span></div><div className="plan-meter"><span style={{ width: "32%" }} /></div><p>2.4 / 7.5 GB memory used</p><button onClick={() => showNotice("Billing and plan management coming soon")}>Manage plan <ArrowUpRight size={13} /></button></div><div className="user-row"><div className="avatar">BG</div><div><strong>Beasgohan</strong><span>Owner</span></div><MoreHorizontal size={17} /></div></div>
+        <div className="sidebar-bottom">
+          <div className="instance-card">
+            <span className="section-kicker">CONTROL PLANE</span>
+            <strong className={apiOnline ? "online" : "offline"}>{apiStatus === "connecting" ? "Connecting" : apiOnline ? "Connected" : "Offline"}</strong>
+            <small>{metrics ? `Process uptime ${formatUptime(metrics.uptimeSeconds)}` : "Waiting for API telemetry"}</small>
+          </div>
+        </div>
       </aside>
+
       <main className="main-content">
-        <header className="topbar"><button className="mobile-menu"><Menu size={18} /></button><div className="breadcrumb"><span>Beasgohan labs</span><span>/</span><strong>{activeSection}</strong></div><div className="top-actions"><div className={`system-pill ${apiOnline ? "online" : "offline"}`}><span className="pulse" /> {systemStatus}</div><button className="icon-button" onClick={() => showNotice("Keyboard shortcuts: ⌘ K to search")}> <CircleHelp size={17} /></button><div className="top-avatar">BG</div></div></header>
+        <header className="topbar">
+          <button className="mobile-menu" aria-label="Toggle navigation" onClick={() => setMobileMenuOpen((open) => !open)}><Menu size={18} /></button>
+          <div className="breadcrumb"><span>Hosting Bot</span><span>/</span><strong>{activeSection}</strong></div>
+          <div className="top-actions">
+            <div className={`system-pill ${apiOnline ? "online" : "offline"}`}><span className="pulse" /> {systemStatus}</div>
+            <button className="icon-button" onClick={() => void refresh()} title="Refresh live data" aria-label="Refresh live data"><RefreshCw size={16} /></button>
+          </div>
+        </header>
+
         <div className="content-wrap">
-          {activeSection === "Overview" && <Overview metrics={metrics} services={services} activities={activities} filteredServices={filteredServices} query={query} setQuery={setQuery} onDeploy={() => setShowDeploy(true)} onSelect={setSelected} selectedId={selected?.id} connected={streamConnected} onStatus={changeStatus} onRedeploy={redeploy} showNotice={showNotice} />}
-          {activeSection === "Services" && <ServicesPage services={filteredServices} query={query} setQuery={setQuery} onDeploy={() => setShowDeploy(true)} onSelect={setSelected} onStatus={changeStatus} onRedeploy={redeploy} />}
+          {activeSection === "Overview" && (
+            <Overview
+              metrics={metrics}
+              monitors={keepAlives}
+              activities={activities}
+              apiStatus={apiStatus}
+              streamConnected={streamConnected}
+              lastUpdatedAt={lastUpdatedAt}
+              onAddMonitor={() => setShowKeepAlive(true)}
+              onNavigate={navigate}
+            />
+          )}
+          {activeSection === "Keep-alive" && (
+            <KeepAlivePage
+              monitors={keepAlives}
+              apiOnline={apiOnline}
+              onAdd={() => setShowKeepAlive(true)}
+              onCheck={checkKeepAlive}
+              onToggle={toggleKeepAlive}
+              onRemove={removeKeepAlive}
+              checkingId={checkingMonitor}
+            />
+          )}
           {activeSection === "Activity" && <ActivityPage activities={activities} />}
-          {activeSection === "Keep-alive" && <KeepAlivePage monitors={keepAlives} apiOnline={apiOnline} onAdd={() => setShowKeepAlive(true)} onCheck={checkKeepAlive} onToggle={toggleKeepAlive} onRemove={removeKeepAlive} checkingId={checkingMonitor} />}
-          {activeSection === "Deployments" && <DeploymentsPage services={services} onRedeploy={redeploy} onSelect={setSelected} />}
-          {activeSection === "Environment" && <PlaceholderPage icon={<Database />} title="Environment variables" description="Encrypted project configuration will live here. Connect a service to manage secrets without committing them to Git." action="Add variable" onAction={() => showNotice("Environment variable editor coming soon")} />}
-          {activeSection === "Access & teams" && <PlaceholderPage icon={<Users />} title="Access & teams" description="Invite your team and control who can deploy, inspect logs, or manage production services." action="Invite teammate" onAction={() => showNotice("Team invitations coming soon")} />}
-          {activeSection === "Settings" && <PlaceholderPage icon={<Settings2 />} title="Workspace settings" description="Project identity, regions, deploy hooks, and runtime defaults will be configured here." action="Edit settings" onAction={() => showNotice("Settings editor coming soon")} />}
         </div>
       </main>
-      {showDeploy && <DeployModal onClose={() => setShowDeploy(false)} onCreate={createService} />}
       {showKeepAlive && <KeepAliveModal onClose={() => setShowKeepAlive(false)} onCreate={createKeepAlive} />}
-      {selected && <ServiceDrawer service={selected} onClose={() => setSelected(null)} onStatus={changeStatus} onRedeploy={redeploy} onRemove={removeService} />}
       {notice && <div className="toast"><Check size={15} />{notice}</div>}
     </div>
   );
@@ -329,55 +256,172 @@ function AmbientScene() {
     ref.current.appendChild(renderer.domElement);
     const geometry = new THREE.BufferGeometry();
     const positions = new Float32Array(1200 * 3);
-    for (let i = 0; i < positions.length; i += 3) { positions[i] = (Math.random() - 0.5) * 11; positions[i + 1] = (Math.random() - 0.5) * 7; positions[i + 2] = (Math.random() - 0.5) * 5; }
+    for (let index = 0; index < positions.length; index += 3) {
+      positions[index] = (Math.random() - 0.5) * 11;
+      positions[index + 1] = (Math.random() - 0.5) * 7;
+      positions[index + 2] = (Math.random() - 0.5) * 5;
+    }
     geometry.setAttribute("position", new THREE.BufferAttribute(positions, 3));
     const points = new THREE.Points(geometry, new THREE.PointsMaterial({ color: 0x9ac9ff, size: 0.012, transparent: true, opacity: 0.5 }));
     scene.add(points);
-    const resize = () => { if (!ref.current) return; const { width, height } = ref.current.getBoundingClientRect(); renderer.setSize(width, height, false); camera.aspect = width / height; camera.updateProjectionMatrix(); };
-    resize(); window.addEventListener("resize", resize);
+    const resize = () => {
+      if (!ref.current) return;
+      const { width, height } = ref.current.getBoundingClientRect();
+      renderer.setSize(width, height, false);
+      camera.aspect = width / height;
+      camera.updateProjectionMatrix();
+    };
+    resize();
+    window.addEventListener("resize", resize);
     let frame = 0;
-    const animateScene = () => { frame = requestAnimationFrame(animateScene); points.rotation.y += 0.00035; points.rotation.x = Math.sin(Date.now() * 0.00012) * 0.06; renderer.render(scene, camera); };
+    const animateScene = () => {
+      frame = requestAnimationFrame(animateScene);
+      points.rotation.y += 0.00035;
+      points.rotation.x = Math.sin(Date.now() * 0.00012) * 0.06;
+      renderer.render(scene, camera);
+    };
     animateScene();
-    return () => { cancelAnimationFrame(frame); window.removeEventListener("resize", resize); geometry.dispose(); points.material.dispose(); renderer.dispose(); renderer.domElement.remove(); };
+    return () => {
+      cancelAnimationFrame(frame);
+      window.removeEventListener("resize", resize);
+      geometry.dispose();
+      points.material.dispose();
+      renderer.dispose();
+      renderer.domElement.remove();
+    };
   }, []);
   return <div ref={ref} className="ambient-scene" aria-hidden="true" />;
 }
 
-function NavItem({ icon, label, count, active, onClick }: { icon: React.ReactNode; label: string; count?: number; active: boolean; onClick: () => void }) { return <button className={`nav-item ${active ? "active" : ""}`} onClick={onClick}>{icon}<span>{label}</span>{count !== undefined && <em>{count}</em>}</button>; }
-function StatusBadge({ status }: { status: ServiceStatus }) { return <span className={`status-badge ${status}`}><span className="status-dot" />{status === "building" ? "BUILDING" : status.toUpperCase()}</span>; }
-function RuntimeIcon({ runtime }: { runtime: Runtime }) { return runtime === "Node.js" ? <Code2 size={15} /> : runtime === "Python" ? <SquareTerminal size={15} /> : <Box size={15} />; }
-function timeAgo(value: number | string) { const delta = Math.max(0, Date.now() - new Date(value).getTime()); const mins = Math.floor(delta / 60000); if (mins < 1) return "just now"; if (mins < 60) return `${mins}m ago`; const hours = Math.floor(mins / 60); if (hours < 24) return `${hours}h ago`; return `${Math.floor(hours / 24)}d ago`; }
+function NavItem({ icon, label, count, active, onClick }: { icon: ReactNode; label: string; count?: number; active: boolean; onClick: () => void }) {
+  return <button className={`nav-item ${active ? "active" : ""}`} onClick={onClick}>{icon}<span>{label}</span>{count !== undefined && <em>{count}</em>}</button>;
+}
 
-function Overview({ metrics, services, activities, filteredServices, query, setQuery, onDeploy, onSelect, selectedId, connected, onStatus, onRedeploy, showNotice }: { metrics: Metrics; services: Service[]; activities: ActivityItem[]; filteredServices: Service[]; query: string; setQuery: (value: string) => void; onDeploy: () => void; onSelect: (service: Service) => void; selectedId?: string; connected: boolean; onStatus: (service: Service, status: "live" | "stopped") => void; onRedeploy: (service: Service) => void; showNotice: (message: string) => void }) {
+function formatUptime(seconds: number) {
+  const days = Math.floor(seconds / 86_400);
+  const hours = Math.floor((seconds % 86_400) / 3_600);
+  const minutes = Math.floor((seconds % 3_600) / 60);
+  if (days) return `${days}d ${hours}h`;
+  if (hours) return `${hours}h ${minutes}m`;
+  if (minutes) return `${minutes}m`;
+  return `${seconds}s`;
+}
+
+function timeAgo(value: number | string) {
+  const delta = Math.max(0, Date.now() - new Date(value).getTime());
+  const minutes = Math.floor(delta / 60_000);
+  if (minutes < 1) return "just now";
+  if (minutes < 60) return `${minutes}m ago`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return `${hours}h ago`;
+  return `${Math.floor(hours / 24)}d ago`;
+}
+
+function Overview({ metrics, monitors, activities, apiStatus, streamConnected, lastUpdatedAt, onAddMonitor, onNavigate }: {
+  metrics: Metrics | null;
+  monitors: KeepAliveMonitor[];
+  activities: ActivityItem[];
+  apiStatus: ApiStatus;
+  streamConnected: boolean;
+  lastUpdatedAt: number | null;
+  onAddMonitor: () => void;
+  onNavigate: (section: string) => void;
+}) {
+  const activeMonitors = monitors.filter((monitor) => monitor.enabled);
+  return (
+    <>
+      <div className="hero animate-in">
+        <div>
+          <div className="eyebrow"><HeartPulse size={13} /> LIVE OPERATIONS</div>
+          <h1>Real data.<br /><span>No guesswork.</span></h1>
+          <p>Control-plane telemetry and verified HTTP checks from your configured endpoints.</p>
+          <div className="overview-sync">{lastUpdatedAt ? `Last synchronized ${new Date(lastUpdatedAt).toLocaleTimeString()}` : "Waiting for the control-plane API"}</div>
+        </div>
+        <div className="hero-actions">
+          <button className="button primary" onClick={onAddMonitor} disabled={apiStatus !== "online"}><Plus size={16} /> Add monitor</button>
+        </div>
+      </div>
+
+      {apiStatus === "offline" && (
+        <div className="monitor-notice">
+          <ShieldCheck size={16} />
+          <div><strong>Live API data is unavailable</strong><span>No sample or cached demo records are displayed. Start the persistent control-plane service to load real measurements and manage monitors.</span></div>
+        </div>
+      )}
+
+      <div className="runner-notice animate-in">
+        <ShieldCheck size={15} />
+        <span><strong>Repository deployments are not enabled.</strong> A restricted deployment runner is not configured, so this dashboard does not report simulated builds or service states.</span>
+      </div>
+
+      <div className="metric-grid animate-in">
+        <MetricCard icon={<HeartPulse />} label="Healthy targets" value={metrics ? `${metrics.healthyMonitors} / ${metrics.activeMonitors}` : "—"} detail={metrics ? `${metrics.totalMonitors} configured monitor${metrics.totalMonitors === 1 ? "" : "s"}` : "Waiting for live telemetry"} tone="lime" />
+        <MetricCard icon={<Activity />} label="Probe success rate" value={!metrics || metrics.probeSuccessRate === null ? "—" : `${metrics.probeSuccessRate.toFixed(2)}%`} detail={metrics ? `${metrics.totalChecks.toLocaleString()} checks recorded` : "Waiting for live telemetry"} tone="blue" />
+        <MetricCard icon={<Cpu />} label="Control-plane RSS" value={metrics ? `${metrics.processMemoryMb} MB` : "—"} detail="Current Node.js process" tone="violet" />
+        <MetricCard icon={<Clock3 />} label="API process uptime" value={metrics ? formatUptime(metrics.uptimeSeconds) : "—"} detail={metrics ? `${metrics.apiRequests.toLocaleString()} requests since start · SSE excluded` : "Waiting for live telemetry"} tone="orange" />
+      </div>
+
+      <div className="section-head animate-in">
+        <div><div className="section-kicker"><span className="live-pulse" /> MONITORED TARGETS</div><h2>Keep-alive checks <span>{monitors.length}</span></h2></div>
+        <button className="text-button" onClick={() => onNavigate("Keep-alive")}>Manage monitors <ArrowUpRight size={13} /></button>
+      </div>
+      {activeMonitors.length ? (
+        <div className="monitor-overview-grid">
+          {activeMonitors.slice(0, 4).map((monitor) => <MonitorOverviewCard key={monitor.id} monitor={monitor} />)}
+        </div>
+      ) : (
+        <div className="empty-state"><HeartPulse size={23} /><h3>{monitors.length ? "No active monitors" : "No monitored targets yet"}</h3><p>{apiStatus === "online" ? "Add a public health URL to start collecting real response status, latency, and history." : "Connect the control-plane API to view and manage endpoint monitors."}</p><button className="button primary compact" onClick={onAddMonitor} disabled={apiStatus !== "online"}><Plus size={14} /> Add monitor</button></div>
+      )}
+
+      <div className="lower-grid animate-in">
+        <div className="panel activity-panel">
+          <div className="panel-head"><div><span className="section-kicker">AUDIT EVENTS</span><h3>Recent activity</h3></div><button className="text-button" onClick={() => onNavigate("Activity")}>View all <ArrowUpRight size={13} /></button></div>
+          {activities.length ? activities.slice(0, 5).map((item) => <ActivityRow key={item.id} item={item} />) : <div className="activity-empty">No monitor events have been recorded.</div>}
+        </div>
+        <div className="panel quick-panel">
+          <div className="panel-head"><div><span className="section-kicker">QUICK ACCESS</span><h3>Monitoring</h3></div><Activity size={17} className="muted-icon" /></div>
+          <div className="quick-links">
+            <button onClick={onAddMonitor} disabled={apiStatus !== "online"}><div className="quick-icon cyan"><Plus size={16} /></div><div><strong>Add a health check</strong><span>Register a public HTTP endpoint</span></div><ArrowUpRight size={14} /></button>
+            <button onClick={() => onNavigate("Keep-alive")}><div className="quick-icon purple"><HeartPulse size={16} /></div><div><strong>Manage monitors</strong><span>Inspect checks and response history</span></div><ArrowUpRight size={14} /></button>
+            <button onClick={() => onNavigate("Activity")}><div className="quick-icon orange"><Clock3 size={16} /></div><div><strong>Review audit events</strong><span>See recorded monitor changes</span></div><ArrowUpRight size={14} /></button>
+          </div>
+        </div>
+      </div>
+      <div className="telemetry-footnote">Telemetry stream: {streamConnected ? "connected" : "polling / reconnecting"} · API data refreshes every 15 seconds</div>
+    </>
+  );
+}
+
+function MetricCard({ icon, label, value, detail, tone }: { icon: ReactNode; label: string; value: string; detail: string; tone: string }) {
+  return <div className={`metric-card ${tone}`}><div className="metric-icon">{icon}</div><div className="metric-label">{label}</div><strong>{value}</strong><span>{detail}</span></div>;
+}
+
+function MonitorOverviewCard({ monitor }: { monitor: KeepAliveMonitor }) {
+  const status = monitor.enabled ? monitor.status : "paused";
+  return (
+    <article className={`monitor-card status-${status}`}>
+      <div className="monitor-card-head"><div className="monitor-title-icon"><HeartPulse size={17} /></div><div className="monitor-title-copy"><h3>{monitor.name}</h3><span>{monitor.intervalMinutes} minute interval</span></div><span className={`monitor-badge ${status}`}><i />{status}</span></div>
+      <a className="monitor-url" href={monitor.url} target="_blank" rel="noreferrer"><span>{monitor.url}</span><ArrowUpRight size={13} /></a>
+      <div className="monitor-stats"><div><span>LAST CHECK</span><strong>{monitor.lastCheckedAt ? timeAgo(monitor.lastCheckedAt) : "Not checked"}</strong></div><div><span>RESPONSE</span><strong>{monitor.lastLatencyMs === null ? "—" : `${monitor.lastLatencyMs} ms`}</strong></div><div><span>HTTP</span><strong>{monitor.lastStatusCode ?? "—"}</strong></div></div>
+    </article>
+  );
+}
+
+function ActivityRow({ item }: { item: ActivityItem }) {
+  return <div className="activity-row"><div className={`activity-icon ${item.tone}`}><span>{item.tone === "success" ? "✓" : item.tone === "warning" ? "!" : "i"}</span></div><div className="activity-copy"><strong>{item.action}</strong><span><b>{item.targetName}</b> · {item.detail}</span></div><time>{timeAgo(item.createdAt)}</time></div>;
+}
+
+function ActivityPage({ activities }: { activities: ActivityItem[] }) {
   return <>
-    <div className="hero animate-in"><div><div className="eyebrow"><Sparkles size={13} /> DEPLOYMENT CONTROL PLANE</div><h1>Ship <span>calmly.</span></h1><p>One quiet place to deploy, observe, and keep every service healthy.</p></div><div className="hero-actions"><button className="button secondary" onClick={() => showNotice("Project settings coming soon")}><Settings2 size={15} /> Project settings</button><button className="button primary" onClick={onDeploy}><Plus size={16} /> New service</button></div></div>
-    <div className="metric-grid animate-in"><MetricCard icon={<Zap />} label="Live services" value={String(metrics.live)} detail={`${metrics.total} total services`} tone="lime" /><MetricCard icon={<TrendingUp />} label="Probe success" value={metrics.uptime} detail="Across recorded checks" tone="blue" /><MetricCard icon={<Cpu />} label="Memory usage" value={`${metrics.memory} MB`} detail="of 7.5 GB workspace" tone="violet" /><MetricCard icon={<Activity />} label="API requests" value={metrics.requests} detail="Since control-plane start" tone="orange" /></div>
-    <ServiceTopology services={services} selectedId={selectedId} onSelect={onSelect} connected={connected} />
-    <div className="section-head animate-in"><div><div className="section-kicker"><span className="live-pulse" /> ACTIVE SERVICES</div><h2>Services <span>{services.length}</span></h2></div><div className="section-tools"><div className="search-box"><Search size={15} /><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search services" /></div><button className="button primary compact" onClick={onDeploy}><Plus size={15} /> New service</button></div></div>
-    <div className="service-grid">{filteredServices.map((service) => <ServiceCard key={service.id} service={service} onSelect={onSelect} onStatus={onStatus} onRedeploy={onRedeploy} />)}{filteredServices.length === 0 && <EmptyState onDeploy={onDeploy} />}</div>
-    <div className="lower-grid animate-in"><div className="panel activity-panel"><div className="panel-head"><div><span className="section-kicker">RECENT ACTIVITY</span><h3>Deployment stream</h3></div><button className="text-button" onClick={() => showNotice("Activity view is available in the sidebar")}>View all <ArrowUpRight size={13} /></button></div>{(activities.length ? activities.slice(0, 4) : fallbackActivity).map((item) => <ActivityRow key={item.id} item={item} />)}</div><div className="panel quick-panel"><div className="panel-head"><div><span className="section-kicker">QUICK ACCESS</span><h3>Build something</h3></div><Sparkles size={17} className="muted-icon" /></div><div className="quick-links"><button onClick={onDeploy}><div className="quick-icon cyan"><Rocket size={16} /></div><div><strong>Deploy a service</strong><span>Connect a Git repository</span></div><ArrowUpRight size={14} /></button><button onClick={() => showNotice("Logs are available from a service detail view")}><div className="quick-icon purple"><Terminal size={16} /></div><div><strong>Inspect logs</strong><span>Stream runtime output</span></div><ArrowUpRight size={14} /></button><button onClick={() => showNotice("Documentation portal coming soon")}><div className="quick-icon orange"><LifeBuoy size={16} /></div><div><strong>Read the docs</strong><span>Learn the deployment flow</span></div><ArrowUpRight size={14} /></button></div></div></div>
+    <PageHeader eyebrow="RECORDED MONITOR EVENTS" title="Activity" description="Events generated by actual monitor checks and configuration changes." />
+    <div className="panel activity-full">
+      {activities.length ? activities.map((item) => <ActivityRow key={item.id} item={item} />) : <div className="activity-empty">No events have been recorded yet.</div>}
+    </div>
   </>;
 }
 
-const fallbackActivity: ActivityItem[] = [
-  { id: "a1", serviceName: "telegram-gateway", action: "Deployment succeeded", detail: "Build completed in 42s", createdAt: new Date(Date.now() - 1080000).toISOString(), tone: "success" },
-  { id: "a2", serviceName: "dashboard-api", action: "Deployment succeeded", detail: "v1.4.0 is live", createdAt: new Date(Date.now() - 2820000).toISOString(), tone: "success" },
-  { id: "a3", serviceName: "landing-preview", action: "Service stopped", detail: "Manual action from dashboard", createdAt: new Date(Date.now() - 4740000).toISOString(), tone: "warning" },
-  { id: "a4", serviceName: "telegram-gateway", action: "Health check passed", detail: "Latency 84ms", createdAt: new Date(Date.now() - 5760000).toISOString(), tone: "info" },
-];
-
-function MetricCard({ icon, label, value, detail, tone }: { icon: React.ReactNode; label: string; value: string; detail: string; tone: string }) { return <div className={`metric-card ${tone}`}><div className="metric-icon">{icon}</div><div className="metric-label">{label}</div><strong>{value}</strong><span>{detail}</span></div>; }
-function ServiceCard({ service, onSelect, onStatus, onRedeploy }: { service: Service; onSelect: (service: Service) => void; onStatus: (service: Service, status: "live" | "stopped") => void; onRedeploy: (service: Service) => void }) { return <article className="service-card animate-in" onClick={() => onSelect(service)}><div className="service-top"><div className="service-title"><div className={`service-icon ${service.runtime === "Python" ? "gold" : "blue"}`}><RuntimeIcon runtime={service.runtime} /></div><div><h3>{service.name}</h3><span>{service.description}</span></div></div><button className="more-button" onClick={(event) => { event.stopPropagation(); onSelect(service); }}><MoreHorizontal size={18} /></button></div><div className="service-status"><StatusBadge status={service.status} /><span className="branch"><GitBranch size={13} />{service.branch}</span><span className="deployed-time"><Clock3 size={12} />{timeAgo(service.lastDeploy)}</span></div><div className="service-url"><Globe2 size={13} />{service.url}<ExternalLink size={12} /></div><div className="service-stats"><div><span>RUNTIME</span><strong>{service.runtime}</strong></div><div><span>REGION</span><strong>{service.region.split(" ")[0]}</strong></div><div><span>MEMORY</span><strong>{service.memory ? `${service.memory} MB` : "—"}</strong></div></div><div className="card-footer"><span className="health"><span className="health-line" />{service.status === "live" ? "Healthy" : service.status === "building" ? "Provisioning" : "Paused"}</span><div className="card-actions">{service.status === "live" ? <button onClick={(event) => { event.stopPropagation(); onStatus(service, "stopped"); }} title="Stop"><span className="stop-square" /></button> : <button onClick={(event) => { event.stopPropagation(); onStatus(service, "live"); }} title="Start"><Zap size={14} /></button>}<button onClick={(event) => { event.stopPropagation(); onRedeploy(service); }} title="Redeploy"><Rocket size={14} /></button></div></div></article>; }
-function ActivityRow({ item }: { item: ActivityItem }) { return <div className="activity-row"><div className={`activity-icon ${item.tone}`}><span>{item.tone === "success" ? "✓" : item.tone === "warning" ? "!" : "i"}</span></div><div className="activity-copy"><strong>{item.action}</strong><span><b>{item.serviceName}</b> · {item.detail}</span></div><time>{timeAgo(item.createdAt)}</time></div>; }
-function EmptyState({ onDeploy }: { onDeploy: () => void }) { return <div className="empty-state"><Cloud size={24} /><h3>No matching services</h3><p>Try another search or create a new service.</p><button className="button primary compact" onClick={onDeploy}><Plus size={14} /> New service</button></div>; }
-function ServicesPage({ services, query, setQuery, onDeploy, onSelect, onStatus, onRedeploy }: { services: Service[]; query: string; setQuery: (value: string) => void; onDeploy: () => void; onSelect: (service: Service) => void; onStatus: (service: Service, status: "live" | "stopped") => void; onRedeploy: (service: Service) => void }) { return <><PageHeader eyebrow="SERVICE REGISTRY" title="Services" description="Every deployable workload in your workspace, in one view." action="New service" onAction={onDeploy} /><div className="wide-toolbar"><div className="search-box"><Search size={15} /><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Filter services" /></div><span className="toolbar-meta">{services.length} services</span></div><div className="service-grid wide-grid">{services.map((service) => <ServiceCard key={service.id} service={service} onSelect={onSelect} onStatus={onStatus} onRedeploy={onRedeploy} />)}</div></>; }
-function ActivityPage({ activities }: { activities: ActivityItem[] }) { return <><PageHeader eyebrow="AUDIT TRAIL" title="Activity" description="A durable timeline for deploys, health checks, and manual actions." /><div className="panel activity-full">{(activities.length ? activities : fallbackActivity).map((item) => <ActivityRow key={item.id} item={item} />)}</div></>; }
-function DeploymentsPage({ services, onRedeploy, onSelect }: { services: Service[]; onRedeploy: (service: Service) => void; onSelect: (service: Service) => void }) { return <><PageHeader eyebrow="RELEASE PIPELINE" title="Deployments" description="Promote changes with an explicit, observable release step." /><div className="panel deployment-table"><div className="table-head"><span>Service</span><span>Source</span><span>Status</span><span>Last deploy</span><span /></div>{services.map((service) => <div className="table-row" key={service.id} onClick={() => onSelect(service)}><div className="table-service"><div className="mini-icon"><RuntimeIcon runtime={service.runtime} /></div><strong>{service.name}</strong></div><span className="source"><Github size={13} /> {service.branch}</span><StatusBadge status={service.status} /><span className="mono muted-text">{timeAgo(service.lastDeploy)}</span><button className="text-button" onClick={(event) => { event.stopPropagation(); onRedeploy(service); }}>Redeploy</button></div>)}</div></>; }
-function PageHeader({ eyebrow, title, description, action, onAction }: { eyebrow: string; title: string; description: string; action?: string; onAction?: () => void }) { return <div className="page-header animate-in"><div><span className="section-kicker">{eyebrow}</span><h1>{title}</h1><p>{description}</p></div>{action && onAction && <button className="button primary" onClick={onAction}><Plus size={16} /> {action}</button>}</div>; }
-function PlaceholderPage({ icon, title, description, action, onAction }: { icon: React.ReactNode; title: string; description: string; action: string; onAction: () => void }) { return <div className="placeholder-page animate-in"><div className="placeholder-icon">{icon}</div><span className="section-kicker">COMING TO YOUR CONTROL PLANE</span><h1>{title}</h1><p>{description}</p><button className="button primary" onClick={onAction}><Plus size={15} /> {action}</button></div>; }
-
-function DeployModal({ onClose, onCreate }: { onClose: () => void; onCreate: (payload: Record<string, string>) => Promise<void> }) { const [form, setForm] = useState({ name: "", repoUrl: "https://github.com/", branch: "main", runtime: "Node.js", region: "Singapore (southeast-1)", description: "" }); const [loading, setLoading] = useState(false); const update = (key: string, value: string) => setForm((current) => ({ ...current, [key]: value })); const submit = async (event: React.FormEvent) => { event.preventDefault(); if (!form.name || !form.repoUrl) return; setLoading(true); await onCreate(form); setLoading(false); }; return <div className="modal-backdrop" onMouseDown={(event) => event.target === event.currentTarget && onClose()}><form className="modal" onSubmit={submit}><div className="modal-head"><div><span className="section-kicker">NEW WORKLOAD</span><h2>Deploy a service</h2><p>Connect a repository and get a live endpoint.</p></div><button type="button" className="icon-button" onClick={onClose}><X size={17} /></button></div><label>Service name<input required value={form.name} onChange={(event) => update("name", event.target.value)} placeholder="e.g. payments-api" /></label><label>Repository URL<div className="input-with-icon"><Github size={15} /><input required type="url" value={form.repoUrl} onChange={(event) => update("repoUrl", event.target.value)} /></div></label><div className="form-row"><label>Branch<input value={form.branch} onChange={(event) => update("branch", event.target.value)} /></label><label>Runtime<select value={form.runtime} onChange={(event) => update("runtime", event.target.value)}><option>Node.js</option><option>Python</option><option>Docker</option></select></label></div><label>Region<select value={form.region} onChange={(event) => update("region", event.target.value)}><option>Singapore (southeast-1)</option><option>Frankfurt (eu-central-1)</option><option>Oregon (us-west-2)</option></select></label><label>Description <span className="optional">optional</span><input value={form.description} onChange={(event) => update("description", event.target.value)} placeholder="What does this service do?" /></label><div className="modal-note"><ShieldCheck size={15} /><span>Deploys start in an isolated control-plane preview. Connect a runner to execute repository builds.</span></div><div className="modal-actions"><button type="button" className="button secondary" onClick={onClose}>Cancel</button><button className="button primary" disabled={loading}>{loading ? <LoaderCircle size={15} className="spin" /> : <Rocket size={15} />} {loading ? "Queuing…" : "Deploy service"}</button></div></form></div>; }
-function ServiceDrawer({ service, onClose, onStatus, onRedeploy, onRemove }: { service: Service; onClose: () => void; onStatus: (service: Service, status: "live" | "stopped") => void; onRedeploy: (service: Service) => void; onRemove: (service: Service) => void }) { return <div className="drawer-backdrop" onMouseDown={(event) => event.target === event.currentTarget && onClose()}><aside className="drawer"><div className="drawer-head"><div className="service-title"><div className={`service-icon ${service.runtime === "Python" ? "gold" : "blue"}`}><RuntimeIcon runtime={service.runtime} /></div><div><h2>{service.name}</h2><span>{service.description}</span></div></div><button className="icon-button" onClick={onClose}><X size={17} /></button></div><div className="drawer-status"><StatusBadge status={service.status} /><span className="branch"><GitBranch size={13} />{service.branch}</span></div><div className="drawer-url"><Globe2 size={14} /><span>{service.url}</span><button onClick={() => navigator.clipboard?.writeText(`https://${service.url}`)}><Copy size={13} /></button></div><div className="drawer-actions"><button className="button primary" onClick={() => onRedeploy(service)}><Rocket size={15} /> Redeploy</button><button className="button secondary" onClick={() => onStatus(service, service.status === "live" ? "stopped" : "live")}>{service.status === "live" ? "Stop service" : "Start service"}</button></div><div className="drawer-section"><span className="section-kicker">SERVICE DETAILS</span><DetailRow label="Runtime" value={service.runtime} icon={<Code2 size={14} />} /><DetailRow label="Region" value={service.region} icon={<Globe2 size={14} />} /><DetailRow label="Build time" value={service.buildTime} icon={<Clock3 size={14} />} /><DetailRow label="Memory" value={`${service.memory || 0} MB`} icon={<Cpu size={14} />} /><DetailRow label="Source" value={service.repoUrl.replace("https://github.com/", "") } icon={<Github size={14} />} /></div><div className="drawer-section logs-preview"><div className="panel-head"><span className="section-kicker">RUNTIME OUTPUT</span><button className="text-button">Open logs <ArrowUpRight size={13} /></button></div><pre><span className="log-muted">12:41:08</span> <span className="log-green">INFO</span> health check passed{`\n`}<span className="log-muted">12:41:12</span> <span className="log-blue">GET</span> /api/health 200 84ms{`\n`}<span className="log-muted">12:41:18</span> <span className="log-green">INFO</span> worker heartbeat ok</pre></div><button className="danger-button" onClick={() => onRemove(service)}><Trash2 size={14} /> Remove service</button></aside></div>; }
-function DetailRow({ label, value, icon }: { label: string; value: string; icon: React.ReactNode }) { return <div className="detail-row"><span>{icon}{label}</span><strong>{value}</strong></div>; }
+function PageHeader({ eyebrow, title, description }: { eyebrow: string; title: string; description: string }) {
+  return <div className="page-header animate-in"><div><span className="section-kicker">{eyebrow}</span><h1>{title}</h1><p>{description}</p></div></div>;
+}
 
 export default App;
