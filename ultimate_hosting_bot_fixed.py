@@ -17,12 +17,13 @@ import sqlite3
 import logging
 import shutil
 import subprocess
+import uuid
 from pathlib import Path
 from datetime import datetime
 from dataclasses import dataclass, asdict
 from typing import Dict, Optional, List
 from enum import Enum
-from collections import defaultdict
+from collections import defaultdict, deque
 from types import SimpleNamespace
 
 from bot_plugins.core import PluginManager
@@ -52,7 +53,11 @@ class Config:
     DB_PATH: Path = BASE_DIR / "hosting.db"
 
     MAX_BOTS_PER_USER: int = 5
-    AUTO_HEAL_INTERVAL: int = 15
+    AUTO_HEAL_INTERVAL: int = max(5, int(os.getenv("AUTO_HEAL_INTERVAL", "15")))
+    AUTO_HEAL_MAX_RESTARTS: int = max(1, int(os.getenv("AUTO_HEAL_MAX_RESTARTS", "5")))
+    AUTO_HEAL_WINDOW_SECONDS: int = max(60, int(os.getenv("AUTO_HEAL_WINDOW_SECONDS", "600")))
+    KEEPALIVE_SWEEP_INTERVAL: int = max(5, int(os.getenv("KEEPALIVE_SWEEP_INTERVAL", "15")))
+    KEEPALIVE_TIMEOUT_SECONDS: int = max(2, int(os.getenv("KEEPALIVE_TIMEOUT_SECONDS", "10")))
     LOG_TAIL_LINES: int = 50
     DEPLOY_TIMEOUT: int = 120
 
@@ -161,6 +166,26 @@ class Database:
                 details TEXT
             )
         """)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS keepalive_monitors (
+                monitor_id TEXT PRIMARY KEY,
+                owner_id INTEGER NOT NULL,
+                name TEXT NOT NULL,
+                url TEXT NOT NULL,
+                interval_seconds INTEGER NOT NULL DEFAULT 300,
+                enabled INTEGER NOT NULL DEFAULT 1,
+                status TEXT NOT NULL DEFAULT 'pending',
+                created_at TEXT NOT NULL,
+                last_checked_at TEXT,
+                last_status_code INTEGER,
+                last_latency_ms INTEGER,
+                consecutive_failures INTEGER NOT NULL DEFAULT 0,
+                success_count INTEGER NOT NULL DEFAULT 0,
+                failure_count INTEGER NOT NULL DEFAULT 0,
+                last_error TEXT
+            )
+        """)
+        cursor.execute("CREATE INDEX IF NOT EXISTS keepalive_owner_idx ON keepalive_monitors(owner_id)")
         self.conn.commit()
 
     def add_bot(self, bot: HostedBot):
@@ -176,13 +201,19 @@ class Database:
         self._audit(bot.bot_id, bot.owner_id, "CREATE", f"Deployed {bot.name}")
 
     def update_bot(self, bot_id: str, **kwargs):
-        if not kwargs:
+        allowed = {
+            "name", "owner_id", "github_url", "status", "mode", "pid", "log_file",
+            "env_vars", "resource_usage", "last_error", "restart_count",
+        }
+        changes = {key: value for key, value in kwargs.items() if key in allowed}
+        if not changes:
             return
-        sets = ", ".join([f"{k}=?" for k in kwargs])
-        values = list(kwargs.values()) + [bot_id]
+        sets = ", ".join([f"{key}=?" for key in changes])
         cursor = self.conn.cursor()
-        cursor.execute(f"UPDATE bots SET {sets}, updated_at=? WHERE bot_id=?", 
-                      [datetime.now().isoformat()] + values)
+        cursor.execute(
+            f"UPDATE bots SET {sets}, updated_at=? WHERE bot_id=?",
+            [*changes.values(), datetime.now().isoformat(), bot_id],
+        )
         self.conn.commit()
 
     def get_bot(self, bot_id: str) -> Optional[HostedBot]:
@@ -220,6 +251,62 @@ class Database:
             "users": total_users
         }
 
+    def add_keepalive(self, owner_id: int, name: str, url: str, interval_seconds: int) -> dict:
+        monitor_id = f"ka_{uuid.uuid4().hex[:8]}"
+        created_at = datetime.now().isoformat()
+        cursor = self.conn.cursor()
+        cursor.execute("""
+            INSERT INTO keepalive_monitors
+                (monitor_id, owner_id, name, url, interval_seconds, enabled, status, created_at)
+            VALUES (?, ?, ?, ?, ?, 1, 'pending', ?)
+        """, (monitor_id, owner_id, name, url, interval_seconds, created_at))
+        self.conn.commit()
+        self._audit(monitor_id, owner_id, "KEEPALIVE_CREATE", f"Added monitor {name}")
+        return self.get_keepalive(monitor_id)
+
+    def get_keepalive(self, monitor_id: str) -> Optional[dict]:
+        cursor = self.conn.cursor()
+        cursor.execute("SELECT * FROM keepalive_monitors WHERE monitor_id=?", (monitor_id,))
+        row = cursor.fetchone()
+        if row is None:
+            return None
+        keys = [item[0] for item in cursor.description]
+        return dict(zip(keys, row))
+
+    def get_keepalives(self, owner_id: Optional[int] = None) -> List[dict]:
+        cursor = self.conn.cursor()
+        if owner_id is None:
+            cursor.execute("SELECT * FROM keepalive_monitors ORDER BY created_at DESC")
+        else:
+            cursor.execute("SELECT * FROM keepalive_monitors WHERE owner_id=? ORDER BY created_at DESC", (owner_id,))
+        keys = [item[0] for item in cursor.description]
+        return [dict(zip(keys, row)) for row in cursor.fetchall()]
+
+    def update_keepalive(self, monitor_id: str, **kwargs):
+        allowed = {
+            "name", "url", "interval_seconds", "enabled", "status", "last_checked_at",
+            "last_status_code", "last_latency_ms", "consecutive_failures", "success_count",
+            "failure_count", "last_error",
+        }
+        changes = {key: value for key, value in kwargs.items() if key in allowed}
+        if not changes:
+            return
+        assignments = ", ".join(f"{key}=?" for key in changes)
+        self.conn.execute(
+            f"UPDATE keepalive_monitors SET {assignments} WHERE monitor_id=?",
+            [*changes.values(), monitor_id],
+        )
+        self.conn.commit()
+
+    def delete_keepalive(self, monitor_id: str) -> bool:
+        monitor = self.get_keepalive(monitor_id)
+        if not monitor:
+            return False
+        self.conn.execute("DELETE FROM keepalive_monitors WHERE monitor_id=?", (monitor_id,))
+        self.conn.commit()
+        self._audit(monitor_id, monitor["owner_id"], "KEEPALIVE_DELETE", f"Removed monitor {monitor['name']}")
+        return True
+
     def _audit(self, bot_id: str, user_id: int, action: str, details: str):
         cursor = self.conn.cursor()
         cursor.execute("""
@@ -238,6 +325,17 @@ class ProcessManager:
     def __init__(self):
         self.processes: Dict[str, subprocess.Popen] = {}
         self._lock = asyncio.Lock()
+        self.auto_heal_attempts: Dict[str, deque[float]] = defaultdict(deque)
+
+    def begin_auto_heal(self, bot_id: str) -> tuple[bool, int]:
+        now = time.monotonic()
+        attempts = self.auto_heal_attempts[bot_id]
+        while attempts and now - attempts[0] > Config.AUTO_HEAL_WINDOW_SECONDS:
+            attempts.popleft()
+        if len(attempts) >= Config.AUTO_HEAL_MAX_RESTARTS:
+            return False, len(attempts)
+        attempts.append(now)
+        return True, len(attempts)
 
     async def deploy(self, bot: HostedBot, password: str = "") -> tuple[bool, str]:
         bot_dir = Config.REPOS_DIR / bot.bot_id
@@ -294,18 +392,17 @@ class ProcessManager:
                     return False, "No Python entry point found in repo!"
                 entry_point = py_files[0]
 
-            log_handle = open(log_file, "a")
-            log_handle.write(f"\n\n=== DEPLOY {datetime.now()} ===\n")
-            log_handle.flush()
-
-            process = subprocess.Popen(
-                [str(venv_python), str(entry_point)],
-                cwd=str(bot_dir),
-                stdout=log_handle,
-                stderr=subprocess.STDOUT,
-                env={**os.environ, **env_dict},
-                preexec_fn=os.setsid
-            )
+            with open(log_file, "a", encoding="utf-8") as log_handle:
+                log_handle.write(f"\n\n=== DEPLOY {datetime.now()} ===\n")
+                log_handle.flush()
+                process = subprocess.Popen(
+                    [str(venv_python), str(entry_point)],
+                    cwd=str(bot_dir),
+                    stdout=log_handle,
+                    stderr=subprocess.STDOUT,
+                    env={**os.environ, **env_dict},
+                    preexec_fn=os.setsid,
+                )
 
             await asyncio.sleep(3)
             if process.poll() is not None:
@@ -442,6 +539,7 @@ class UI:
             [InlineKeyboardButton("🚀 DEPLOY NEW BOT", callback_data="nav_deploy")],
             [InlineKeyboardButton("📋 MY BOTS", callback_data="nav_list"),
              InlineKeyboardButton("📊 STATUS", callback_data="nav_status")],
+            [InlineKeyboardButton("💓 KEEP-ALIVE", callback_data="nav_keepalive")],
             [InlineKeyboardButton("⚙️ SETTINGS", callback_data="nav_settings"),
              InlineKeyboardButton("❓ HELP", callback_data="nav_help")],
         ]
@@ -561,18 +659,18 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     welcome = (
         f"<b>🤖 ULTIMATE HOSTING BOT v3.1</b>\n\n"
         f"Welcome, {user.mention_html()}!\n\n"
-        f"{ui.blockquote('Deploy and manage unlimited Telegram bots from GitHub with live logs, auto-healing, and full process isolation.')}\n\n"
+        f"{ui.blockquote('Deploy and manage Telegram bot workers from GitHub with process isolation, crash-loop protection, and endpoint health monitoring.')}\n\n"
         f"<b>🚀 Quick Start:</b>\n"
         f"1. Click <b>DEPLOY NEW BOT</b>\n"
         f"2. Paste your GitHub URL\n"
-        f"3. Watch it go live instantly\n\n"
-        f"<b>⚡ Ultra Features:</b>\n"
+        f"3. Inspect its logs and health from Telegram\n\n"
+        f"<b>⚡ Operations:</b>\n"
         f"• Live log streaming with auto-refresh\n"
-        f"• Auto-heal crash recovery\n"
-        f"• 3 runtime modes (Prod/Dev/Maint)\n"
-        f"• Full inline button control\n"
-        f"• Resource monitoring\n"
-        f"• One-click backup/restore"
+        f"• Bounded auto-heal with restart circuit breaker\n"
+        f"• Scheduled HTTP keep-alive checks and alerts\n"
+        f"• Production, development, and maintenance modes\n"
+        f"• Resource monitoring and one-click backups\n"
+        f"• Use <code>/keepalive help</code> to monitor a URL"
     )
 
     await update.message.reply_html(welcome, reply_markup=ui.main_menu(user.id))
@@ -628,14 +726,25 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
     elif data == "nav_deploy":
+        example_quote = ui.blockquote("Example: https://github.com/username/mybot\n\nThe repo must contain a main.py or bot.py and optionally requirements.txt")
         await query.edit_message_text(
             f"<b>🚀 Deploy New Bot</b>\n\n"
             f"Step 1/4: Send me the <b>GitHub Repository URL</b>\n\n"
-            f"{ui.blockquote('Example: https://github.com/username/mybot\n\nThe repo must contain a main.py or bot.py and optionally requirements.txt')}\n\n"
-            f"Type /cancel to abort.",
+            f"{example_quote}\n\n"
+            "Type /cancel to abort.",
             parse_mode="HTML"
         )
         return ST_DEPLOY_URL
+
+    elif data == "nav_keepalive":
+        await query.edit_message_text(
+            "<b>💓 KEEP-ALIVE MONITORS</b>\n\n"
+            "Monitor public health endpoints on a schedule and receive an alert when they go down or recover.\n\n"
+            "<code>/keepalive add https://your-site.example/health 5</code>\n"
+            "<code>/keepalive</code> lists your targets. Use <code>/keepalive help</code> for pause, resume, check, and remove commands.",
+            parse_mode="HTML",
+            reply_markup=ui.main_menu(user_id),
+        )
 
     elif data == "nav_list":
         await show_bot_list(query, user_id)
@@ -725,10 +834,11 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not bot:
             await query.answer("Bot not found!", show_alert=True)
             return
+        mode_help = ui.blockquote("Production = Auto-heal + Optimized\nDevelopment = Verbose + No auto-restart\nMaintenance = Offline mode")
         await query.edit_message_text(
             f"<b>⚙️ Change Mode: {bot.name}</b>\n\n"
             f"Current: <code>{bot.mode.upper()}</code>\n\n"
-            f"{ui.blockquote('Production = Auto-heal + Optimized\nDevelopment = Verbose + No auto-restart\nMaintenance = Offline mode')}",
+            f"{mode_help}",
             parse_mode="HTML",
             reply_markup=ui.mode_selector(bot_id)
         )
@@ -1393,47 +1503,59 @@ async def broadcast_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ═══════════════════════════════════════════════════════════════════
 
 async def auto_heal_task(context: ContextTypes.DEFAULT_TYPE):
-    while True:
-        try:
-            bots = db.get_all_bots()
-            for bot in bots:
-                if bot.mode != BotMode.PRODUCTION.value:
+    """One watchdog pass; JobQueue owns cadence and shutdown lifecycle."""
+    try:
+        bots = db.get_all_bots()
+        for bot in bots:
+            if bot.mode != BotMode.PRODUCTION.value:
+                continue
+
+            is_alive = process_mgr.is_alive(bot.bot_id)
+            if bot.status == "running" and not is_alive:
+                allowed, attempt_count = process_mgr.begin_auto_heal(bot.bot_id)
+                if not allowed:
+                    message = (
+                        f"Auto-heal paused after {attempt_count} restarts in "
+                        f"{Config.AUTO_HEAL_WINDOW_SECONDS}s; inspect logs and restart manually."
+                    )
+                    db.update_bot(bot.bot_id, status="error", pid=None, last_error=message[:200])
+                    logger.error("Auto-heal circuit breaker opened for %s", bot.bot_id)
                     continue
 
-                is_alive = process_mgr.is_alive(bot.bot_id)
+                logger.warning("Auto-heal attempt %s/%s for %s", attempt_count, Config.AUTO_HEAL_MAX_RESTARTS, bot.bot_id)
+                success, msg = await process_mgr.restart(bot)
+                if success:
+                    process = process_mgr.processes.get(bot.bot_id)
+                    db.update_bot(
+                        bot.bot_id,
+                        status="running",
+                        pid=process.pid if process else None,
+                        log_file=bot.log_file,
+                        restart_count=bot.restart_count + 1,
+                        last_error=None,
+                    )
+                    logger.info("Auto-healed %s", bot.bot_id)
+                else:
+                    db.update_bot(bot.bot_id, status="error", pid=None, last_error=msg[:200])
+                    logger.error("Auto-heal failed for %s", bot.bot_id)
 
-                if bot.status == "running" and not is_alive:
-                    logger.warning(f"💀 Auto-heal triggered for {bot.bot_id}")
-                    success, msg = await process_mgr.restart(bot)
-                    if success:
-                        db.update_bot(bot.bot_id, status="running", 
-                                    restart_count=bot.restart_count + 1,
-                                    last_error=f"Auto-healed at {datetime.now()}")
-                        logger.info(f"✅ Auto-healed {bot.bot_id}")
-                    else:
-                        db.update_bot(bot.bot_id, status="error", last_error=msg[:200])
-                        logger.error(f"❌ Auto-heal failed for {bot.bot_id}")
-
-                elif is_alive and bot.pid:
-                    try:
-                        proc = await asyncio.create_subprocess_exec(
-                            "ps", "-p", str(bot.pid), "-o", "%cpu,%mem", 
-                            stdout=asyncio.subprocess.PIPE
-                        )
-                        stdout, _ = await proc.communicate()
-                        lines = stdout.decode().strip().split('\n')
-                        if len(lines) > 1:
-                            cpu, mem = lines[1].strip().split()
-                            db.update_bot(bot.bot_id, resource_usage=json.dumps({
-                                "cpu": f"{cpu}%", "mem": f"{mem}%", "checked": datetime.now().isoformat()
-                            }))
-                    except Exception:
-                        pass
-
-        except Exception as e:
-            logger.error(f"Auto-heal error: {e}")
-
-        await asyncio.sleep(Config.AUTO_HEAL_INTERVAL)
+            elif is_alive and bot.pid:
+                try:
+                    proc = await asyncio.create_subprocess_exec(
+                        "ps", "-p", str(bot.pid), "-o", "%cpu,%mem",
+                        stdout=asyncio.subprocess.PIPE,
+                    )
+                    stdout, _ = await proc.communicate()
+                    lines = stdout.decode().strip().split("\n")
+                    if len(lines) > 1:
+                        cpu, mem = lines[1].strip().split()
+                        db.update_bot(bot.bot_id, resource_usage=json.dumps({
+                            "cpu": f"{cpu}%", "mem": f"{mem}%", "checked": datetime.now().isoformat()
+                        }))
+                except Exception:
+                    logger.debug("Could not collect resource usage for %s", bot.bot_id, exc_info=True)
+    except Exception as e:
+        logger.error("Auto-heal check error: %s", e)
 
 # ═══════════════════════════════════════════════════════════════════
 # MAIN
@@ -1500,9 +1622,11 @@ def main():
     application.add_handler(broadcast_conv)
     application.add_handler(CallbackQueryHandler(callback_router))
 
-    application.job_queue.run_once(
-        lambda ctx: asyncio.create_task(auto_heal_task(ctx)), 
-        when=5
+    application.job_queue.run_repeating(
+        auto_heal_task,
+        interval=Config.AUTO_HEAL_INTERVAL,
+        first=5,
+        name="process-auto-heal-watchdog",
     )
 
     logger.info("🤖 ULTIMATE HOSTING BOT v4.0 STARTED with %s plugins", len([p for p in plugin_manager.loaded if p.enabled]))

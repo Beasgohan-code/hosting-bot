@@ -11,8 +11,9 @@ Hosting Bot is a small deployment control plane for the existing Telegram hostin
 | Dashboard | React, Vite, Three.js, anime.js | Service overview, deploy flow, activity, status controls, detail drawer |
 | API | TypeScript, Express, Zod | Health checks, service CRUD, start/stop, redeploy lifecycle |
 | Persistence | `data/services.json` | Local registry and activity timeline; replace with Postgres when multi-user auth is added |
-| Telegram worker | Existing Python bot | Telegram-native deployment management, logs, auto-healing, and process controls |
-| Deployment | Docker + `render.yaml` | Separate web control plane and Telegram worker services |
+| Telegram worker | Python bot + plugin runtime | Telegram-native deployment management, logs, circuit-breaker auto-healing, and public endpoint monitors with Telegram alerts |
+| Keep-alive API | Express scheduler + JSON registry | Scheduled HTTP probes, latency/status history, pause/resume, manual checks, and SSRF-safe public target validation |
+| Deployment | Docker + `render.yaml` | Separate always-on web control plane and Telegram worker services |
 
 ## Local development
 
@@ -40,6 +41,13 @@ The service API exposes:
 | `PATCH` | `/api/services/:id/status` | Start or stop a service |
 | `POST` | `/api/services/:id/redeploy` | Start a new release cycle |
 | `DELETE` | `/api/services/:id` | Remove a service from the registry |
+| `GET` | `/api/keepalives` | List scheduled endpoint monitors |
+| `POST` | `/api/keepalives` | Create a public HTTP(S) keep-alive monitor |
+| `PATCH` | `/api/keepalives/:id` | Pause or resume scheduled checks |
+| `POST` | `/api/keepalives/:id/check` | Run an immediate check and record the result |
+| `DELETE` | `/api/keepalives/:id` | Remove a monitor |
+
+Keep-alive checks run every minute or longer, store the latest 20 results per target, report latency and HTTP status, and broadcast state changes over the existing event stream. Targets are restricted to public HTTP(S) endpoints; private/local IPs, embedded credentials, query strings, and redirects are blocked to reduce SSRF risk. The Telegram worker exposes matching `/keepalive` commands and alerts the monitor owner when an endpoint transitions between healthy and failing.
 
 ## Telegram worker configuration
 
@@ -53,7 +61,13 @@ Do not commit tokens, cookies, or a populated `hosting_data` directory.
 
 ## Render deployment
 
-The included `render.yaml` creates two services: a Node web service named `hosting-bot-control-plane` and a Docker worker named `hosting-bot-telegram-worker`. Set the `BOT_TOKEN` and `ADMIN_IDS` environment variables in the Render dashboard. The control plane is deployable as-is; for real arbitrary repository builds, attach a separate isolated runner and replace the lifecycle simulation in `server/index.ts` with a queue-backed runner adapter.
+The included `render.yaml` creates two services: a Node web service named `hosting-bot-control-plane` and a Docker worker named `hosting-bot-telegram-worker`. Set the `BOT_TOKEN` and `ADMIN_IDS` environment variables in the Render dashboard. Keep both the control plane and the Telegram worker on an always-on host for their schedulers. For real arbitrary repository builds, attach a separate isolated runner and replace the lifecycle simulation in `server/index.ts` with a queue-backed runner adapter.
+
+## Vercel deployment
+
+`vercel.json` configures a Vite static build for the dashboard. Connect this repository to Vercel and set `VITE_DEMO_MODE=true` for a standalone static preview. To connect a persistent API instead, set `VITE_API_BASE_URL` to its origin and configure the API's `CORS_ORIGIN` with the exact Vercel dashboard origin(s). The dashboard uses a clear preview/offline status until the API is reachable.
+
+Vercel is suitable for the static dashboard, but it cannot keep the Telegram polling worker or the in-process keep-alive scheduler running continuously. The Python worker and scheduled monitor API must run on Render, a VPS, or another persistent service. The current file-backed JSON registry is intentionally single-instance and is not a serverless database.
 
 ## Next production steps
 
@@ -67,8 +81,11 @@ The Telegram worker now loads extensions through `bot_plugins.core.PluginManager
 | --- | --- | --- |
 | `diagnostics` | `/health`, `/plugins`, `/stats` | Inspect health, loaded extensions, and aggregate service counts |
 | `services` | `/services`, `/service <bot_id>` | List hosted services and inspect one service |
+| `keepalive` | `/keepalive` | Add, check, pause, resume, or remove public HTTP monitors; sends down/recovery alerts |
 | `admin` | `/admin`, `/restartall` | Guarded admin summary and production restarts |
 | `example` | `/ping` | Reference local extension in `bot_plugins/local/example_plugin.py` |
+
+Use `/keepalive help` for the command syntax. For example, `/keepalive add https://my-service.example/health 5` checks a public endpoint every five minutes. The worker blocks local/private destinations and does not follow redirects. Process auto-healing uses a configurable restart budget to prevent crash loops; after the budget is reached the service is marked as an error for manual inspection.
 
 A minimal extension looks like this:
 

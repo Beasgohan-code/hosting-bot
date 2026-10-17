@@ -8,6 +8,7 @@
     "dev": "concurrently -k \"tsx watch server/index.ts\" \"vite --host 0.0.0.0\"",
     "dev:server": "tsx watch server/index.ts",
     "build": "tsc --noEmit && vite build && esbuild server/index.ts --platform=node --packages=external --bundle --format=esm --outdir=dist-server",
+    "build:web": "tsc --noEmit && vite build",
     "start": "NODE_ENV=production node dist-server/index.js",
     "check": "tsc --noEmit",
     "test": "vitest run"

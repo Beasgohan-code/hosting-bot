@@ -18,13 +18,17 @@ import {
   Github,
   GitBranch,
   Globe2,
+  HeartPulse,
   Layers3,
   LayoutDashboard,
   LifeBuoy,
   LoaderCircle,
   Menu,
   MoreHorizontal,
+  Pause,
+  Play,
   Plus,
+  RefreshCw,
   Rocket,
   Search,
   Server,
@@ -39,9 +43,14 @@ import {
   X,
   Zap,
 } from "lucide-react";
+import { KeepAliveModal, KeepAlivePage } from "./components/KeepAliveManager";
 import ServiceTopology from "./components/ServiceTopology";
-import type { ActivityItem, Metrics, Runtime, Service, ServiceStatus } from "./types";
+import type { ActivityItem, KeepAliveMonitor, Metrics, Runtime, Service, ServiceStatus } from "./types";
 import "./styles.css";
+
+const API_BASE_URL = (import.meta.env.VITE_API_BASE_URL ?? "").trim().replace(/\/+$/, "");
+const isDemoMode = import.meta.env.VITE_DEMO_MODE === "true" && !API_BASE_URL;
+const apiPath = (route: string) => `${API_BASE_URL}${route}`;
 
 const fallbackServices: Service[] = [
   { id: "svc_gateway", name: "telegram-gateway", repoUrl: "https://github.com/Beasgohan-code/hosting-bot", branch: "main", runtime: "Python", region: "Singapore (southeast-1)", status: "live", url: "telegram-gateway.hosting.bot", lastDeploy: Date.now() - 1080000, createdAt: Date.now(), updatedAt: Date.now(), buildTime: "42s", cpu: 12, memory: 148, description: "Telegram worker with auto-healing and log streaming" },
@@ -52,42 +61,66 @@ const fallbackServices: Service[] = [
 function App() {
   const [services, setServices] = useState<Service[]>(fallbackServices);
   const [activities, setActivities] = useState<ActivityItem[]>([]);
-  const [metrics, setMetrics] = useState<Metrics>({ live: 2, building: 0, total: 3, memory: 244, uptime: "99.98%", requests: "1.24M" });
+  const [keepAlives, setKeepAlives] = useState<KeepAliveMonitor[]>([]);
+  const [metrics, setMetrics] = useState<Metrics>({ live: 2, building: 0, total: 3, memory: 244, uptime: "—", requests: "0" });
   const [activeSection, setActiveSection] = useState("Overview");
   const [showDeploy, setShowDeploy] = useState(false);
+  const [showKeepAlive, setShowKeepAlive] = useState(false);
   const [selected, setSelected] = useState<Service | null>(null);
   const [query, setQuery] = useState("");
   const [notice, setNotice] = useState("");
   const [streamConnected, setStreamConnected] = useState(false);
+  const [apiOnline, setApiOnline] = useState(false);
+  const [checkingMonitor, setCheckingMonitor] = useState<string | null>(null);
 
-  async function refresh() {
+  async function refresh(): Promise<boolean> {
+    if (isDemoMode) {
+      setApiOnline(false);
+      return false;
+    }
     try {
-      const response = await fetch("/api/overview");
+      const response = await fetch(apiPath("/api/overview"));
       if (!response.ok) throw new Error("API unavailable");
       const data = await response.json();
       setServices(data.services);
       setActivities(data.activities);
+      setKeepAlives(data.keepAlives ?? []);
       setMetrics(data.metrics);
+      setApiOnline(true);
+      return true;
     } catch {
-      // The dashboard remains useful in preview mode when the API is not running.
+      setApiOnline(false);
+      return false;
     }
   }
 
   useEffect(() => {
-    void refresh();
-    const source = new EventSource("/api/events");
-    source.addEventListener("overview", (event) => {
-      const data = JSON.parse((event as MessageEvent).data) as { services: Service[]; activities: ActivityItem[]; metrics: Metrics };
-      setServices(data.services);
-      setActivities(data.activities);
-      setMetrics(data.metrics);
-      setStreamConnected(true);
+    if (isDemoMode) return;
+    let source: EventSource | null = null;
+    let disposed = false;
+    void refresh().then((online) => {
+      if (!online || disposed) return;
+      source = new EventSource(apiPath("/api/events"));
+      source.addEventListener("overview", (event) => {
+        try {
+          const data = JSON.parse((event as MessageEvent).data) as { services: Service[]; activities: ActivityItem[]; keepAlives?: KeepAliveMonitor[]; metrics: Metrics };
+          setServices(data.services);
+          setActivities(data.activities);
+          setKeepAlives(data.keepAlives ?? []);
+          setMetrics(data.metrics);
+          setApiOnline(true);
+          setStreamConnected(true);
+        } catch {
+          setStreamConnected(false);
+        }
+      });
+      source.onopen = () => setStreamConnected(true);
+      source.onerror = () => { setStreamConnected(false); setApiOnline(false); };
     });
-    source.onopen = () => setStreamConnected(true);
-    source.onerror = () => setStreamConnected(false);
-    return () => source.close();
+    return () => { disposed = true; source?.close(); };
   }, []);
   useEffect(() => {
+    if (isDemoMode) return;
     const timer = window.setInterval(() => void refresh(), 15000);
     return () => window.clearInterval(timer);
   }, []);
@@ -100,13 +133,36 @@ function App() {
 
   async function changeStatus(service: Service, status: "live" | "stopped") {
     setServices((current) => current.map((item) => item.id === service.id ? { ...item, status, cpu: status === "live" ? Math.max(item.cpu, 5) : 0, memory: status === "live" ? Math.max(item.memory, 80) : 0 } : item));
-    try { await fetch(`/api/services/${service.id}/status`, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ status }) }); await refresh(); } catch { /* preview mode */ }
-    showNotice(`${service.name} ${status === "live" ? "started" : "stopped"}`);
+    if (!apiOnline) {
+      showNotice(`${service.name} updated in local preview`);
+      return;
+    }
+    try {
+      const response = await fetch(apiPath(`/api/services/${service.id}/status`), { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ status }) });
+      if (!response.ok) throw new Error("Status update failed");
+      await refresh();
+      showNotice(`${service.name} ${status === "live" ? "started" : "stopped"}`);
+    } catch {
+      setServices((current) => current.map((item) => item.id === service.id ? service : item));
+      showNotice(`Could not update ${service.name}`);
+    }
   }
 
   async function redeploy(service: Service) {
     setServices((current) => current.map((item) => item.id === service.id ? { ...item, status: "building" } : item));
-    try { await fetch(`/api/services/${service.id}/redeploy`, { method: "POST" }); } catch { window.setTimeout(() => setServices((current) => current.map((item) => item.id === service.id ? { ...item, status: "live", lastDeploy: Date.now() } : item)), 1600); }
+    if (!apiOnline) {
+      window.setTimeout(() => setServices((current) => current.map((item) => item.id === service.id ? { ...item, status: "live", lastDeploy: Date.now() } : item)), 1600);
+      showNotice("Demo redeploy simulated locally");
+      return;
+    }
+    try {
+      const response = await fetch(apiPath(`/api/services/${service.id}/redeploy`), { method: "POST" });
+      if (!response.ok) throw new Error("Redeploy failed");
+    } catch {
+      setServices((current) => current.map((item) => item.id === service.id ? { ...item, status: "failed" } : item));
+      showNotice(`Could not redeploy ${service.name}`);
+      return;
+    }
     showNotice(`Redeploying ${service.name}`);
     window.setTimeout(() => void refresh(), 2200);
   }
@@ -114,13 +170,24 @@ function App() {
   async function removeService(service: Service) {
     setServices((current) => current.filter((item) => item.id !== service.id));
     setSelected(null);
-    try { await fetch(`/api/services/${service.id}`, { method: "DELETE" }); } catch { /* preview mode */ }
-    showNotice(`${service.name} removed from project`);
+    if (!apiOnline) {
+      showNotice(`${service.name} removed from local preview`);
+      return;
+    }
+    try {
+      const response = await fetch(apiPath(`/api/services/${service.id}`), { method: "DELETE" });
+      if (!response.ok) throw new Error("Remove failed");
+      showNotice(`${service.name} removed from project`);
+    } catch {
+      setServices((current) => [service, ...current]);
+      showNotice(`Could not remove ${service.name}`);
+    }
   }
 
   async function createService(payload: Record<string, string>) {
     try {
-      const response = await fetch("/api/services", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) });
+      if (!apiOnline) throw new Error("Preview mode");
+      const response = await fetch(apiPath("/api/services"), { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) });
       if (response.ok) await refresh();
       else throw new Error("Unable to create");
     } catch {
@@ -129,8 +196,85 @@ function App() {
       window.setTimeout(() => setServices((current) => current.map((item) => item.id === created.id ? { ...item, status: "live", buildTime: "34s", cpu: 6, memory: 96, lastDeploy: Date.now() } : item)), 1600);
     }
     setShowDeploy(false);
-    showNotice(`${payload.name} is being deployed`);
+    showNotice(apiOnline ? `${payload.name} is being deployed` : `${payload.name} added to this local preview`);
   }
+
+  async function createKeepAlive(payload: { name: string; url: string; intervalMinutes: number }) {
+    if (!apiOnline) {
+      showNotice("Keep-alive monitors need the persistent control-plane API.");
+      return;
+    }
+    try {
+      const response = await fetch(apiPath("/api/keepalives"), {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ ...payload, name: payload.name.trim() || undefined }),
+      });
+      const result = await response.json();
+      if (!response.ok) throw new Error(result.error || "Unable to create monitor");
+      setKeepAlives((current) => [result as KeepAliveMonitor, ...current]);
+      setShowKeepAlive(false);
+      showNotice(`Monitoring ${result.name}`);
+      void refresh();
+    } catch (error) {
+      showNotice(error instanceof Error ? error.message : "Could not add monitor");
+    }
+  }
+
+  async function checkKeepAlive(monitor: KeepAliveMonitor) {
+    if (!apiOnline) return showNotice("Connect the persistent control-plane API to run checks.");
+    setCheckingMonitor(monitor.id);
+    try {
+      const response = await fetch(apiPath(`/api/keepalives/${monitor.id}/check`), { method: "POST" });
+      const result = await response.json();
+      if (!response.ok) throw new Error(result.error || "Check failed");
+      setKeepAlives((current) => current.map((item) => item.id === monitor.id ? result as KeepAliveMonitor : item));
+      showNotice(result.status === "up" ? `${monitor.name} is responding` : `${monitor.name} did not respond`);
+      void refresh();
+    } catch (error) {
+      showNotice(error instanceof Error ? error.message : "Check failed");
+    } finally {
+      setCheckingMonitor(null);
+    }
+  }
+
+  async function toggleKeepAlive(monitor: KeepAliveMonitor, enabled: boolean) {
+    if (!apiOnline) return showNotice("Connect the persistent control-plane API to manage monitors.");
+    try {
+      const response = await fetch(apiPath(`/api/keepalives/${monitor.id}`), {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ enabled }),
+      });
+      const result = await response.json();
+      if (!response.ok) throw new Error(result.error || "Unable to update monitor");
+      setKeepAlives((current) => current.map((item) => item.id === monitor.id ? result as KeepAliveMonitor : item));
+      showNotice(`${monitor.name} ${enabled ? "resumed" : "paused"}`);
+    } catch (error) {
+      showNotice(error instanceof Error ? error.message : "Unable to update monitor");
+    }
+  }
+
+  async function removeKeepAlive(monitor: KeepAliveMonitor) {
+    if (!apiOnline) return showNotice("Connect the persistent control-plane API to remove monitors.");
+    try {
+      const response = await fetch(apiPath(`/api/keepalives/${monitor.id}`), { method: "DELETE" });
+      if (!response.ok) throw new Error("Unable to remove monitor");
+      setKeepAlives((current) => current.filter((item) => item.id !== monitor.id));
+      showNotice(`${monitor.name} removed`);
+    } catch (error) {
+      showNotice(error instanceof Error ? error.message : "Unable to remove monitor");
+    }
+  }
+
+  const failedMonitors = keepAlives.filter((monitor) => monitor.enabled && monitor.status === "down").length;
+  const systemStatus = isDemoMode
+    ? "Demo preview · API not connected"
+    : !apiOnline
+      ? "Control plane reconnecting"
+      : failedMonitors > 0
+        ? `${failedMonitors} monitor${failedMonitors === 1 ? "" : "s"} failing`
+        : "Control plane online";
 
   return (
     <div className="app-shell">
@@ -144,6 +288,7 @@ function App() {
           <NavItem icon={<Server size={16} />} label="Services" count={services.length} active={activeSection === "Services"} onClick={() => setActiveSection("Services")} />
           <NavItem icon={<Rocket size={16} />} label="Deployments" active={activeSection === "Deployments"} onClick={() => setActiveSection("Deployments")} />
           <NavItem icon={<Activity size={16} />} label="Activity" active={activeSection === "Activity"} onClick={() => setActiveSection("Activity")} />
+          <NavItem icon={<HeartPulse size={16} />} label="Keep-alive" count={keepAlives.length} active={activeSection === "Keep-alive"} onClick={() => setActiveSection("Keep-alive")} />
           <span className="nav-label nav-spacer">CONFIGURATION</span>
           <NavItem icon={<Database size={16} />} label="Environment" active={activeSection === "Environment"} onClick={() => setActiveSection("Environment")} />
           <NavItem icon={<ShieldCheck size={16} />} label="Access & teams" active={activeSection === "Access & teams"} onClick={() => setActiveSection("Access & teams")} />
@@ -152,11 +297,12 @@ function App() {
         <div className="sidebar-bottom"><div className="plan-card"><div className="plan-top"><span className="plan-dot" /> Free workspace <span>·</span> <span className="mono">v1.4</span></div><div className="plan-meter"><span style={{ width: "32%" }} /></div><p>2.4 / 7.5 GB memory used</p><button onClick={() => showNotice("Billing and plan management coming soon")}>Manage plan <ArrowUpRight size={13} /></button></div><div className="user-row"><div className="avatar">BG</div><div><strong>Beasgohan</strong><span>Owner</span></div><MoreHorizontal size={17} /></div></div>
       </aside>
       <main className="main-content">
-        <header className="topbar"><button className="mobile-menu"><Menu size={18} /></button><div className="breadcrumb"><span>Beasgohan labs</span><span>/</span><strong>{activeSection}</strong></div><div className="top-actions"><div className="system-pill"><span className="pulse" /> All systems operational</div><button className="icon-button" onClick={() => showNotice("Keyboard shortcuts: ⌘ K to search")}> <CircleHelp size={17} /></button><div className="top-avatar">BG</div></div></header>
+        <header className="topbar"><button className="mobile-menu"><Menu size={18} /></button><div className="breadcrumb"><span>Beasgohan labs</span><span>/</span><strong>{activeSection}</strong></div><div className="top-actions"><div className={`system-pill ${apiOnline ? "online" : "offline"}`}><span className="pulse" /> {systemStatus}</div><button className="icon-button" onClick={() => showNotice("Keyboard shortcuts: ⌘ K to search")}> <CircleHelp size={17} /></button><div className="top-avatar">BG</div></div></header>
         <div className="content-wrap">
           {activeSection === "Overview" && <Overview metrics={metrics} services={services} activities={activities} filteredServices={filteredServices} query={query} setQuery={setQuery} onDeploy={() => setShowDeploy(true)} onSelect={setSelected} selectedId={selected?.id} connected={streamConnected} onStatus={changeStatus} onRedeploy={redeploy} showNotice={showNotice} />}
           {activeSection === "Services" && <ServicesPage services={filteredServices} query={query} setQuery={setQuery} onDeploy={() => setShowDeploy(true)} onSelect={setSelected} onStatus={changeStatus} onRedeploy={redeploy} />}
           {activeSection === "Activity" && <ActivityPage activities={activities} />}
+          {activeSection === "Keep-alive" && <KeepAlivePage monitors={keepAlives} apiOnline={apiOnline} onAdd={() => setShowKeepAlive(true)} onCheck={checkKeepAlive} onToggle={toggleKeepAlive} onRemove={removeKeepAlive} checkingId={checkingMonitor} />}
           {activeSection === "Deployments" && <DeploymentsPage services={services} onRedeploy={redeploy} onSelect={setSelected} />}
           {activeSection === "Environment" && <PlaceholderPage icon={<Database />} title="Environment variables" description="Encrypted project configuration will live here. Connect a service to manage secrets without committing them to Git." action="Add variable" onAction={() => showNotice("Environment variable editor coming soon")} />}
           {activeSection === "Access & teams" && <PlaceholderPage icon={<Users />} title="Access & teams" description="Invite your team and control who can deploy, inspect logs, or manage production services." action="Invite teammate" onAction={() => showNotice("Team invitations coming soon")} />}
@@ -164,6 +310,7 @@ function App() {
         </div>
       </main>
       {showDeploy && <DeployModal onClose={() => setShowDeploy(false)} onCreate={createService} />}
+      {showKeepAlive && <KeepAliveModal onClose={() => setShowKeepAlive(false)} onCreate={createKeepAlive} />}
       {selected && <ServiceDrawer service={selected} onClose={() => setSelected(null)} onStatus={changeStatus} onRedeploy={redeploy} onRemove={removeService} />}
       {notice && <div className="toast"><Check size={15} />{notice}</div>}
     </div>
@@ -204,7 +351,7 @@ function timeAgo(value: number | string) { const delta = Math.max(0, Date.now() 
 function Overview({ metrics, services, activities, filteredServices, query, setQuery, onDeploy, onSelect, selectedId, connected, onStatus, onRedeploy, showNotice }: { metrics: Metrics; services: Service[]; activities: ActivityItem[]; filteredServices: Service[]; query: string; setQuery: (value: string) => void; onDeploy: () => void; onSelect: (service: Service) => void; selectedId?: string; connected: boolean; onStatus: (service: Service, status: "live" | "stopped") => void; onRedeploy: (service: Service) => void; showNotice: (message: string) => void }) {
   return <>
     <div className="hero animate-in"><div><div className="eyebrow"><Sparkles size={13} /> DEPLOYMENT CONTROL PLANE</div><h1>Ship <span>calmly.</span></h1><p>One quiet place to deploy, observe, and keep every service healthy.</p></div><div className="hero-actions"><button className="button secondary" onClick={() => showNotice("Project settings coming soon")}><Settings2 size={15} /> Project settings</button><button className="button primary" onClick={onDeploy}><Plus size={16} /> New service</button></div></div>
-    <div className="metric-grid animate-in"><MetricCard icon={<Zap />} label="Live services" value={String(metrics.live)} detail={`${metrics.total} total services`} tone="lime" /><MetricCard icon={<TrendingUp />} label="30d uptime" value={metrics.uptime} detail="Across all production" tone="blue" /><MetricCard icon={<Cpu />} label="Memory usage" value={`${metrics.memory} MB`} detail="of 7.5 GB workspace" tone="violet" /><MetricCard icon={<Activity />} label="Requests today" value={metrics.requests} detail="+18.4% from yesterday" tone="orange" /></div>
+    <div className="metric-grid animate-in"><MetricCard icon={<Zap />} label="Live services" value={String(metrics.live)} detail={`${metrics.total} total services`} tone="lime" /><MetricCard icon={<TrendingUp />} label="Probe success" value={metrics.uptime} detail="Across recorded checks" tone="blue" /><MetricCard icon={<Cpu />} label="Memory usage" value={`${metrics.memory} MB`} detail="of 7.5 GB workspace" tone="violet" /><MetricCard icon={<Activity />} label="API requests" value={metrics.requests} detail="Since control-plane start" tone="orange" /></div>
     <ServiceTopology services={services} selectedId={selectedId} onSelect={onSelect} connected={connected} />
     <div className="section-head animate-in"><div><div className="section-kicker"><span className="live-pulse" /> ACTIVE SERVICES</div><h2>Services <span>{services.length}</span></h2></div><div className="section-tools"><div className="search-box"><Search size={15} /><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search services" /></div><button className="button primary compact" onClick={onDeploy}><Plus size={15} /> New service</button></div></div>
     <div className="service-grid">{filteredServices.map((service) => <ServiceCard key={service.id} service={service} onSelect={onSelect} onStatus={onStatus} onRedeploy={onRedeploy} />)}{filteredServices.length === 0 && <EmptyState onDeploy={onDeploy} />}</div>

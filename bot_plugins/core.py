@@ -80,6 +80,7 @@ class PluginManager:
     BUILTIN_MODULES = (
         "bot_plugins.builtin.diagnostics",
         "bot_plugins.builtin.services",
+        "bot_plugins.builtin.keepalive",
         "bot_plugins.builtin.admin",
     )
 
