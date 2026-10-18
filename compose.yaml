@@ -4,7 +4,7 @@ services:
   control-plane:
     build:
       context: .
-      dockerfile: Dockerfile
+      dockerfile: Dockerfile.control-plane
     image: hosting-bot-control-plane:local
     restart: unless-stopped
     init: true
@@ -82,6 +82,41 @@ services:
         max-size: 10m
         max-file: "3"
 
+  all-in-one:
+    profiles: ["all-in-one"]
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: hosting-bot-all-in-one:local
+    restart: unless-stopped
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=64m
+    ports:
+      - "${DASHBOARD_PORT:-8787}:8787"
+    env_file:
+      - .env
+    environment:
+      NODE_ENV: production
+      PORT: "8787"
+      DATA_DIR: /var/lib/hosting-bot/control-plane
+      HOSTING_DATA_DIR: /var/lib/hosting-bot/telegram-worker
+      HEALTH_HOST: "0.0.0.0"
+      HEALTH_PORT: "8788"
+    volumes:
+      - all-in-one-data:/var/lib/hosting-bot
+    stop_grace_period: 60s
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
+
 volumes:
   control-plane-data:
   telegram-worker-data:
+  all-in-one-data:

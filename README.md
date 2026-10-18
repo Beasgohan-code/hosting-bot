@@ -64,7 +64,7 @@ The one-click backup action creates private ZIP archives with a 100 MiB uncompre
 
 ## Docker Compose deployment
 
-The Compose stack runs the API/dashboard control plane and the Telegram worker as separate, non-root containers. It includes image-level and Compose health checks, graceful-stop windows, restart policies, read-only root filesystems, dropped Linux capabilities, bounded JSON logs, and named volumes for persistent application data.
+The default Compose stack runs the API/dashboard control plane and Telegram worker as separate, non-root containers. It includes image-level and Compose health checks, graceful-stop windows, restart policies, read-only root filesystems, dropped Linux capabilities, bounded JSON logs, and named volumes for persistent application data. The root `Dockerfile` is an all-in-one image that runs both applications; `Dockerfile.control-plane` and `Dockerfile.bot` remain available for the isolated Compose services.
 
 1. Install Docker Engine with the Compose v2 plugin, then create your local environment file:
 
@@ -83,9 +83,34 @@ The Compose stack runs the API/dashboard control plane and the Telegram worker a
 
 4. Open `http://localhost:8787` (or the host port set with `DASHBOARD_PORT`). The control-plane API is exposed on that same port; the worker's health port is internal to the Compose network and is not published publicly.
 
-The control plane's health endpoint is `GET /api/health`. The Telegram worker's readiness endpoint is `GET /readyz` on container port `8788`. Health status is visible with `docker compose ps`; inspect a service with `docker compose logs -f control-plane` or `docker compose logs -f telegram-worker`. To stop the stack without removing state, run `docker compose down`. The named volumes `control-plane-data` and `telegram-worker-data` preserve monitor state, the worker SQLite database, logs, backups, and hosted repositories across rebuilds. **Do not use `docker compose down -v` unless you intend to permanently delete that data.** Back up these volumes before maintenance or migration.
+The control plane's health endpoint is `GET /api/health`. The Telegram worker's readiness endpoint is `GET /readyz` on container port `8788`. Health status is visible with `docker compose ps`; inspect a service with `docker compose logs -f control-plane` or `docker compose logs -f telegram-worker`. To stop the stack without removing state, run `docker compose down`. The named volumes `control-plane-data` and `telegram-worker-data` preserve monitor state, the worker SQLite database, logs, backups, and hosted repositories across rebuilds; the all-in-one profile uses `all-in-one-data`. **Do not use `docker compose down -v` unless you intend to permanently delete that data.** Back up these volumes before maintenance or migration.
 
-The Node image is multi-stage and installs only API runtime dependencies in its final layer. The Python worker installs the project's application requirements at image build time. Update the project files and rebuild with `docker compose up --build -d`; changes to Python requirements also require rebuilding the worker image. If port `8787` is already in use, set `DASHBOARD_PORT` in `.env` to another host port. Never publish the Telegram health port or put a real bot token in the Compose file or image.
+The control-plane image installs only API runtime dependencies in its final layer. The Python worker installs the project's application requirements at image build time. Update the project files and rebuild with `docker compose up --build -d`; changes to Python requirements also require rebuilding the worker image. If port `8787` is already in use, set `DASHBOARD_PORT` in `.env` to another host port. Never publish the Telegram health port or put a real bot token in a Dockerfile or image.
+
+### Single-image / all-in-one option
+
+For a single Docker container that starts both the dashboard/API and Telegram polling worker, use the root `Dockerfile`:
+
+```bash
+docker compose --profile all-in-one up --build -d all-in-one
+docker compose logs -f all-in-one
+```
+
+Or build and run it directly:
+
+```bash
+docker build -t hosting-bot:all-in-one .
+docker run -d --name hosting-bot --restart unless-stopped \
+  --read-only --cap-drop ALL --security-opt no-new-privileges:true \
+  --tmpfs /tmp:rw,noexec,nosuid,size=64m \
+  --env-file .env -e NODE_ENV=production -e PORT=8787 \
+  -e DATA_DIR=/var/lib/hosting-bot/control-plane \
+  -e HOSTING_DATA_DIR=/var/lib/hosting-bot/telegram-worker \
+  -p 8787:8787 -v hosting-bot-data:/var/lib/hosting-bot \
+  hosting-bot:all-in-one
+```
+
+The image requires `BOT_TOKEN` and keeps both services' data in `/var/lib/hosting-bot`; only the dashboard/API port is published. Its health check requires both the API and Telegram worker to be ready. Choose this mode **instead of** the default Compose services, not alongside them—the combined container shares one security/restart boundary and would otherwise duplicate Telegram polling. For production and hosted-repository isolation, the separate services remain preferred.
 
 The worker runs hosted repositories as an unprivileged user, but a container is not a full security boundary for executing arbitrary untrusted code. For multi-user/public hosting, isolate user deployments in separate restricted runner containers/VMs with resource limits, no shared secrets, and a queue-backed deployment service.
 
