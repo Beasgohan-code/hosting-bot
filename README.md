@@ -56,9 +56,11 @@ The Python worker now reads secrets from the environment. Set `BOT_TOKEN` and a 
 BOT_TOKEN=123456:replace-me ADMIN_IDS=123456789 python ultimate_hosting_bot_fixed.py
 ```
 
-Do not commit tokens, cookies, or a populated `hosting_data` directory. The worker's container health endpoint is available at `/livez`, `/readyz`, and `/healthz` on port `8788`; readiness becomes healthy only after the Telegram application and plugins have started. Configure `HEALTH_HOST` and `HEALTH_PORT` only if you need to change the defaults.
+Do not commit tokens, cookies, or a populated `hosting_data` directory. If a bot token is ever exposed in a log, screenshot, chat, or URL, revoke it with BotFather immediately, replace `BOT_TOKEN` in the deployment environment, and redeploy; existing provider logs cannot be scrubbed from this worker. The worker now redacts Telegram bot tokens from its own logs and suppresses HTTPX request-URL info logs, but these controls are defense in depth, not a substitute for rotation. The worker's container health endpoint is available at `/livez`, `/readyz`, and `/healthz` on port `8788`; readiness becomes healthy only after the Telegram application and plugins have started. Configure `HEALTH_HOST` and `HEALTH_PORT` only if you need to change the defaults.
 
-When a deployment, manual start/restart, update, environment-change restart, or auto-heal attempt fails, the worker sends configured admins a Telegram DM with the service/owner IDs, failure reason, and recent log lines. Set `ADMIN_IDS` to comma-separated Telegram user IDs, and have each admin open the bot and send `/start` once so Telegram permits the worker to message them. Common token/password formats are redacted before logs are sent, but this is best-effort—not a guarantee that every secret is detected—so hosted applications should not print credentials to stdout/stderr. If an admin DM cannot be delivered, the worker records the send failure in its own logs.
+When a deployment, manual start/restart, update, environment-change restart, or auto-heal attempt fails, the worker sends configured admins a Telegram DM with the service/owner IDs, failure reason, and recent log lines. Unhandled Telegram update errors are also logged safely and sent to admins with a short cooldown to prevent alert floods. Set `ADMIN_IDS` to comma-separated Telegram user IDs, and have each admin open the bot and send `/start` once so Telegram permits the worker to message them. Common token/password formats are redacted before logs are sent, but this is best-effort—not a guarantee that every secret is detected—so hosted applications should not print credentials to stdout/stderr. If an admin DM cannot be delivered, the worker records the send failure in its own logs.
+
+Core commands are `/help`, `/status`, `/id`, `/logs`, and `/cancel`. `/help` reflects the currently loaded plugins; `/status` scopes service and keep-alive counts to the requesting user, while admins see global counts and worker metrics. Telegram's default command menu omits admin-only plugin commands, and configured admins receive a private command menu. Admin broadcasts escape HTML, rate-limit delivery, and report sent/failed counts.
 
 The one-click backup action creates private ZIP archives with a 100 MiB uncompressed-data and 20,000-file limit, keeps the five newest per service, and excludes `.git`, dependency/cache directories, and symbolic links. Archives up to 20 MiB are sent to the requesting user's Telegram DM; larger ones remain in the persistent worker volume.
 
@@ -134,10 +136,10 @@ The Telegram worker now loads extensions through `bot_plugins.core.PluginManager
 
 | Plugin | Commands | Purpose |
 | --- | --- | --- |
-| `diagnostics` | `/health`, `/plugins`, `/stats` | Inspect health, loaded extensions, and aggregate service counts |
+| `diagnostics` | `/health`, `/plugins`, `/stats` (admin-only) | Inspect health and loaded extensions; aggregate service counts are restricted to admins |
 | `services` | `/services`, `/service <bot_id>` | List hosted services and inspect one service |
 | `keepalive` | `/keepalive` | Add, check, pause, resume, or remove public HTTP monitors; sends down/recovery alerts |
-| `admin` | `/admin`, `/restartall` | Guarded admin summary and production restarts |
+| `admin` | `/admin`, `/restartall` | Guarded admin summary and restart of running or failed production services; stopped services remain stopped |
 | `example` | `/ping` | Reference local extension in `bot_plugins/local/example_plugin.py` |
 
 Use `/keepalive help` for the command syntax. For example, `/keepalive add https://my-service.example/health 5` checks a public endpoint every five minutes. The worker blocks local/private destinations and does not follow redirects. Process auto-healing uses a configurable restart budget to prevent crash loops; after the budget is reached the service is marked as an error for manual inspection.

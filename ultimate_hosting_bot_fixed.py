@@ -38,12 +38,42 @@ from bot_plugins.core import PluginManager
 
 from telegram import (
     Update, InlineKeyboardButton, InlineKeyboardMarkup,
-    BotCommand, InputFile
+    BotCommand, BotCommandScopeChat, BotCommandScopeDefault, InputFile
 )
 from telegram.ext import (
     Application, CommandHandler, CallbackQueryHandler,
     ConversationHandler, MessageHandler, filters, ContextTypes
 )
+
+_TELEGRAM_API_URL_TOKEN = re.compile(r"(?i)(/bot)\d{6,12}:[A-Za-z0-9_-]{20,}")
+_TELEGRAM_BARE_TOKEN = re.compile(r"\b\d{6,12}:[A-Za-z0-9_-]{20,}\b")
+
+
+def _redact_telegram_tokens(text: str) -> str:
+    text = _TELEGRAM_API_URL_TOKEN.sub(
+        lambda match: f"{match.group(1)}[REDACTED_TELEGRAM_TOKEN]", text
+    )
+    return _TELEGRAM_BARE_TOKEN.sub("[REDACTED_TELEGRAM_TOKEN]", text)
+
+
+class TelegramTokenLogFilter(logging.Filter):
+    """Prevent Telegram Bot API tokens from reaching stdout or log files."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            record.msg = _redact_telegram_tokens(record.getMessage())
+            record.args = ()
+            if record.exc_info:
+                record.exc_text = _redact_telegram_tokens(
+                    logging.Formatter().formatException(record.exc_info)
+                )
+            if record.stack_info:
+                record.stack_info = _redact_telegram_tokens(record.stack_info)
+        except Exception:
+            # Logging must never break application behavior.
+            pass
+        return True
+
 
 # ═══════════════════════════════════════════════════════════════════
 # CONFIGURATION — works on Termux, VPS, Replit, anywhere
@@ -101,7 +131,13 @@ logging.basicConfig(
         logging.FileHandler(str(Config.BASE_DIR / "hosting_master.log"))
     ]
 )
+# HTTPX logs Bot API request URLs at INFO level; Telegram bot tokens are in those URLs.
+for noisy_logger in ("httpx", "httpcore"):
+    logging.getLogger(noisy_logger).setLevel(logging.WARNING)
+for handler in logging.getLogger().handlers:
+    handler.addFilter(TelegramTokenLogFilter())
 logger = logging.getLogger("UltimateHost")
+WORKER_STARTED_MONOTONIC = time.monotonic()
 
 
 class WorkerHealthHandler(BaseHTTPRequestHandler):
@@ -329,6 +365,11 @@ class Database:
         cursor = self.conn.cursor()
         cursor.execute("SELECT * FROM bots")
         return [HostedBot.from_row(r) for r in cursor.fetchall()]
+
+    def get_user_ids(self) -> list[int]:
+        cursor = self.conn.cursor()
+        cursor.execute("SELECT DISTINCT owner_id FROM bots ORDER BY owner_id")
+        return [int(row[0]) for row in cursor.fetchall()]
 
     def get_stats(self) -> dict:
         cursor = self.conn.cursor()
@@ -1325,13 +1366,7 @@ def redact_sensitive_log_text(text: str) -> str:
             lowered = line.lower()
             search_from = value_start + len("[REDACTED]")
 
-        for part in line.split():
-            candidate = part.strip(".,;()[]{}<>\"'")
-            if ":" not in candidate:
-                continue
-            prefix, suffix = candidate.split(":", 1)
-            if prefix.isdigit() and 6 <= len(prefix) <= 12 and len(suffix) >= 20 and all(char.isalnum() or char in "-_" for char in suffix):
-                line = line.replace(candidate, "[REDACTED_TELEGRAM_TOKEN]")
+        line = _redact_telegram_tokens(line)
         redacted_lines.append("".join(char for char in line if ord(char) >= 32 or char in (chr(9), chr(10), chr(13))))
     return chr(10).join(redacted_lines)
 
@@ -1427,12 +1462,173 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_html(welcome, reply_markup=ui.main_menu(user.id))
 
+def _format_duration(seconds: float) -> str:
+    remaining = max(0, int(seconds))
+    days, remaining = divmod(remaining, 86400)
+    hours, remaining = divmod(remaining, 3600)
+    minutes, seconds = divmod(remaining, 60)
+    parts = []
+    if days:
+        parts.append(f"{days}d")
+    if hours or days:
+        parts.append(f"{hours}h")
+    if minutes or hours or days:
+        parts.append(f"{minutes}m")
+    parts.append(f"{seconds}s")
+    return " ".join(parts)
+
+
+def _format_bytes(value: int) -> str:
+    amount = float(value)
+    for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
+        if amount < 1024 or unit == "TiB":
+            return f"{amount:.1f} {unit}"
+        amount /= 1024
+    return f"{amount:.1f} TiB"
+
+
+def build_help_text(user_id: int, plugin_manager: PluginManager | None = None) -> str:
+    is_admin = user_id in Config.ADMIN_IDS
+    lines = [
+        "<b>❓ HOSTING BOT HELP</b>",
+        "",
+        "<b>Core commands</b>",
+        "<code>/start</code> — Open the control menu",
+        "<code>/help</code> — Show this guide",
+        "<code>/status</code> — View your service status",
+        "<code>/id</code> — Show your Telegram user ID for admin setup",
+        "<code>/logs [service_id] [lines]</code> — View recent logs",
+        "<code>/cancel</code> — Cancel the current wizard",
+    ]
+    if is_admin:
+        lines.extend([
+            "",
+            "<b>Admin</b>",
+            "<code>/admin</code> — Open admin operations",
+            "<code>/restartall</code> — Restart running or failed production services",
+        ])
+    lines.extend([
+        "",
+        "Use the menu to deploy a public GitHub Python repository, manage its environment, view logs, update code, and create backups.",
+    ])
+    if plugin_manager is not None:
+        plugin_count = 0
+        for loaded in plugin_manager.loaded:
+            if not loaded.enabled or (loaded.plugin.spec.admin_only and not is_admin):
+                continue
+            commands = [
+                (command, description)
+                for command, description in loaded.plugin.spec.commands
+                if is_admin or command not in loaded.plugin.spec.admin_commands
+            ]
+            if not commands:
+                continue
+            if plugin_count >= 12:
+                lines.append("Additional extensions are listed by <code>/plugins</code>.")
+                break
+            plugin_count += 1
+            plugin_name = escape(loaded.plugin.spec.name[:80], quote=False)
+            lines.extend(["", f"<b>{plugin_name}</b>"])
+            for command, description in commands[:8]:
+                lines.append(
+                    f"<code>/{escape(command[:32], quote=False)}</code> — "
+                    f"{escape(description[:100], quote=False)}"
+                )
+    lines.extend(["", "Use <code>/keepalive help</code> for public endpoint monitoring."])
+
+    # Each line contains self-contained HTML, so safe truncation cannot leave unclosed tags.
+    selected_lines = []
+    character_count = 0
+    for line in lines:
+        added_length = len(line) + (1 if selected_lines else 0)
+        if character_count + added_length > 3800:
+            selected_lines.append("<i>Additional commands are available via /plugins.</i>")
+            break
+        selected_lines.append(line)
+        character_count += added_length
+    return chr(10).join(selected_lines)
+
+
+def build_status_text(user_id: int) -> str:
+    is_admin = user_id in Config.ADMIN_IDS
+    bots = db.get_all_bots() if is_admin else db.get_user_bots(user_id)
+    statuses = {
+        "running": "🟢 Running",
+        "not_running": "🔴 Not responding",
+        "stopped": "⏹ Stopped",
+        "error": "🔴 Needs attention",
+        "deploying": "🟡 Deploying",
+        "restarting": "🔄 Restarting",
+        "maintenance": "🔧 Maintenance",
+    }
+    status_counts = {status: 0 for status in statuses}
+    other_statuses = 0
+    for bot in bots:
+        current_status = bot.status
+        if current_status == BotStatus.RUNNING.value and not process_mgr.is_alive(bot.bot_id):
+            current_status = "not_running"
+        if current_status in status_counts:
+            status_counts[current_status] += 1
+        else:
+            other_statuses += 1
+    lines = [
+        "<b>📊 SERVICE STATUS</b>",
+        "",
+        f"Services in scope: <code>{len(bots)}</code>",
+    ]
+    for status, label in statuses.items():
+        lines.append(f"{label}: <code>{status_counts[status]}</code>")
+    if other_statuses:
+        lines.append(f"⚪ Other: <code>{other_statuses}</code>")
+
+    monitors = db.get_keepalives(None if is_admin else user_id)
+    lines.extend(["", f"Keep-alive monitors: <code>{len(monitors)}</code>"])
+    if is_admin:
+        try:
+            usage = shutil.disk_usage(Config.BASE_DIR)
+            storage = f"{_format_bytes(usage.free)} free of {_format_bytes(usage.total)}"
+        except OSError:
+            storage = "unavailable"
+        lines.extend([
+            "",
+            "<b>Worker</b>",
+            f"Uptime: <code>{_format_duration(time.monotonic() - WORKER_STARTED_MONOTONIC)}</code>",
+            f"Auto-heal cadence: <code>{Config.AUTO_HEAL_INTERVAL}s</code>",
+            f"Hosting data storage: <code>{escape(storage, quote=False)}</code>",
+        ])
+    return chr(10).join(lines)
+
+
+async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    manager = context.application.bot_data.get("plugin_manager")
+    await update.effective_message.reply_html(
+        build_help_text(user.id, manager),
+        reply_markup=ui.main_menu(user.id),
+    )
+
+
+async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    await update.effective_message.reply_html(
+        build_status_text(user_id),
+        reply_markup=ui.main_menu(user_id),
+    )
+
+
+async def cmd_user_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    await update.effective_message.reply_text(
+        f"Your Telegram user ID is {user.id}. Configure this value in ADMIN_IDS to grant administrator access."
+    )
+
+
 async def cmd_logs(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     args = context.args
 
     if not args:
-        user_bots = db.get_user_bots(user_id)
+        user_bots = db.get_all_bots() if user_id in Config.ADMIN_IDS else db.get_user_bots(user_id)
         if not user_bots:
             await update.message.reply_text("You have no bots. Deploy one first!")
             return
@@ -1464,15 +1660,112 @@ async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("❌ Cancelled.", reply_markup=ui.main_menu(update.effective_user.id))
     return ConversationHandler.END
 
+_ERROR_ADMIN_ALERT_COOLDOWN_SECONDS = 60
+_recent_telegram_error_alerts: dict[str, float] = {}
+
+
+async def telegram_error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    error = context.error
+    if error is None:
+        return
+
+    detail = redact_sensitive_log_text(str(error)).strip() or "No error detail available."
+    logger.error(
+        "Unhandled Telegram update error (%s): %s",
+        type(error).__name__,
+        detail,
+        exc_info=(type(error), error, error.__traceback__),
+    )
+
+    update_id = getattr(update, "update_id", "unknown")
+    effective_user = getattr(update, "effective_user", None)
+    user_id = getattr(effective_user, "id", None)
+    effective_message = getattr(update, "effective_message", None)
+    if effective_message is not None and getattr(getattr(effective_message, "chat", None), "type", None) == "private":
+        try:
+            await effective_message.reply_text(
+                f"⚠️ Something went wrong while handling that request. Reference: {update_id}."
+            )
+        except Exception:
+            logger.debug("Could not send the user-facing error notice", exc_info=True)
+
+    now = time.monotonic()
+    alert_key = f"{type(error).__name__}:{detail[:240]}"
+    for key, sent_at in list(_recent_telegram_error_alerts.items()):
+        if now - sent_at > _ERROR_ADMIN_ALERT_COOLDOWN_SECONDS:
+            _recent_telegram_error_alerts.pop(key, None)
+    if now - _recent_telegram_error_alerts.get(alert_key, 0) < _ERROR_ADMIN_ALERT_COOLDOWN_SECONDS:
+        return
+    if len(_recent_telegram_error_alerts) >= 512:
+        oldest_key = min(_recent_telegram_error_alerts, key=_recent_telegram_error_alerts.get)
+        _recent_telegram_error_alerts.pop(oldest_key, None)
+    _recent_telegram_error_alerts[alert_key] = now
+
+    alert = (
+        "⚠️ Telegram worker encountered an unhandled update error.\n"
+        f"Type: {type(error).__name__}\n"
+        f"Update ID: {update_id}\n"
+        f"User ID: {user_id if user_id is not None else 'unknown'}\n"
+        f"Details: {detail[:900]}"
+    )
+    for admin_id in Config.ADMIN_IDS:
+        try:
+            await context.bot.send_message(chat_id=admin_id, text=alert)
+        except Exception:
+            logger.warning("Could not DM admin %s about a Telegram handler error", admin_id, exc_info=True)
+
+
+_CALLBACK_ANSWER_CACHE_LIMIT = 4096
+_answered_callback_ids: set[str] = set()
+_answered_callback_order: deque[str] = deque()
+
+
+async def answer_callback_once(query, *args, **kwargs) -> bool:
+    callback_id = getattr(query, "id", None)
+    if callback_id is not None and callback_id in _answered_callback_ids:
+        return False
+    if callback_id is not None:
+        if len(_answered_callback_order) >= _CALLBACK_ANSWER_CACHE_LIMIT:
+            _answered_callback_ids.discard(_answered_callback_order.popleft())
+        _answered_callback_order.append(callback_id)
+        _answered_callback_ids.add(callback_id)
+    try:
+        await query.answer(*args, **kwargs)
+    except Exception:
+        if callback_id is not None:
+            _answered_callback_ids.discard(callback_id)
+        raise
+    return True
+
+
 # ═══════════════════════════════════════════════════════════════════
 # CALLBACK ROUTER
 # ═══════════════════════════════════════════════════════════════════
 
 async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
     user_id = update.effective_user.id
-    data = query.data
+    data = query.data or ""
+
+    if (data == "nav_admin" or data.startswith("admin_")) and user_id not in Config.ADMIN_IDS:
+        await answer_callback_once(query, "⛔ Admin only!", show_alert=True)
+        return ST_IDLE
+
+    service_callback_prefixes = (
+        "nav_manage_", "act_start_", "act_stop_", "act_restart_", "act_logs_",
+        "act_livelogs_", "act_logdl_", "act_mode_", "act_env_", "act_pull_",
+        "act_backup_", "act_delete_", "del_confirm_", "mode_prod_", "mode_dev_",
+        "mode_maint_",
+    )
+    for prefix in service_callback_prefixes:
+        if data.startswith(prefix):
+            bot_id = data[len(prefix):]
+            if not can_manage_bot(db.get_bot(bot_id), user_id):
+                await answer_callback_once(query, "Service not found or access denied.", show_alert=True)
+                return ST_IDLE
+            break
+
+    await answer_callback_once(query)
 
     if data == "nav_main":
         await query.edit_message_text(
@@ -1506,7 +1799,7 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await show_bot_list(query, user_id)
 
     elif data == "nav_status":
-        await show_status(query)
+        await show_status(query, user_id)
 
     elif data == "nav_settings":
         await query.edit_message_text(
@@ -1522,28 +1815,16 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
     elif data == "nav_help":
+        manager = context.application.bot_data.get("plugin_manager")
         await query.edit_message_text(
-            f"<b>❓ Help Center</b>\n\n"
-            f"<b>Commands:</b>\n"
-            f"/start - Main menu\n"
-            f"/logs [bot_id] [lines] - View logs\n"
-            f"/cancel - Cancel operation\n\n"
-            f"<b>Modes:</b>\n"
-            f"🟢 <b>Production</b> - Auto-restart, optimized\n"
-            f"🟡 <b>Development</b> - Debug mode, verbose\n"
-            f"🔧 <b>Maintenance</b> - Bot offline\n\n"
-            f"{ui.blockquote('Need help? Contact the admin.')}",
+            build_help_text(user_id, manager),
             parse_mode="HTML",
             reply_markup=InlineKeyboardMarkup([[
                 InlineKeyboardButton("🔙 Back", callback_data="nav_main")
-            ]])
+            ]]),
         )
 
     elif data == "nav_admin":
-        if user_id not in Config.ADMIN_IDS:
-            await query.answer("⛔ Admin only!", show_alert=True)
-            return
-
         stats = db.get_stats()
         text = (
             f"<b>🔴 ADMIN PANEL</b>\n\n"
@@ -1588,11 +1869,11 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         bot_id = data.split("_", 2)[2]
         bot = db.get_bot(bot_id)
         if not can_manage_bot(bot, user_id):
-            await query.answer("Service not found or access denied.", show_alert=True)
+            await answer_callback_once(query, "Service not found or access denied.", show_alert=True)
             return
         mode_help = ui.blockquote("Production = Auto-heal + Optimized\nDevelopment = Verbose + No auto-restart\nMaintenance = Offline mode")
         await query.edit_message_text(
-            f"<b>⚙️ Change Mode: {bot.name}</b>\n\n"
+            f"<b>⚙️ Change Mode: {escape(bot.name, quote=False)}</b>\n\n"
             f"Current: <code>{bot.mode.upper()}</code>\n\n"
             f"{mode_help}",
             parse_mode="HTML",
@@ -1603,7 +1884,7 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         bot_id = data.split("_", 2)[2]
         bot = db.get_bot(bot_id)
         if not can_manage_bot(bot, user_id):
-            await query.answer("Service not found or access denied.", show_alert=True)
+            await answer_callback_once(query, "Service not found or access denied.", show_alert=True)
             return
         context.user_data["env_bot_id"] = bot_id
         try:
@@ -1637,10 +1918,10 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         bot_id = data.split("_", 2)[2]
         bot = db.get_bot(bot_id)
         if not can_manage_bot(bot, user_id):
-            await query.answer("Service not found or access denied.", show_alert=True)
+            await answer_callback_once(query, "Service not found or access denied.", show_alert=True)
             return
         await query.edit_message_text(
-            f"⚠️ <b>Delete {bot.name}?</b>\n\n"
+            f"⚠️ <b>Delete {escape(bot.name, quote=False)}?</b>\n\n"
             f"This will permanently remove the bot and all its data.\n\n"
             f"{ui.blockquote('This action cannot be undone!')}",
             parse_mode="HTML",
@@ -1660,7 +1941,7 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif data == "admin_broadcast":
         await query.edit_message_text(
-            "<b>📢 Broadcast Message</b>\n\nSend the message to broadcast to all users:\n/cancel to abort.",
+            "<b>📢 Broadcast Message</b>\n\nSend the message to broadcast to registered service owners:\n/cancel to abort.",
             parse_mode="HTML"
         )
         return ST_BROADCAST
@@ -1669,7 +1950,7 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await handle_cleanup(query, user_id)
 
     elif data == "admin_restart_all":
-        await handle_restart_all(query, user_id)
+        await handle_restart_all(query, user_id, context)
 
     elif data == "admin_sysinfo":
         await show_sysinfo(query)
@@ -1706,7 +1987,7 @@ async def show_bot_list(query, user_id: int):
 async def show_bot_manage(query, bot_id: str, user_id: int):
     bot = db.get_bot(bot_id)
     if not can_manage_bot(bot, user_id):
-        await query.answer("⛔ Access denied!", show_alert=True)
+        await answer_callback_once(query, "⛔ Access denied!", show_alert=True)
         return
 
     text = (
@@ -1725,10 +2006,10 @@ async def show_bot_manage(query, bot_id: str, user_id: int):
 async def handle_start(query, bot_id: str, user_id: int, context: ContextTypes.DEFAULT_TYPE):
     bot = db.get_bot(bot_id)
     if not can_manage_bot(bot, user_id):
-        await query.answer("Denied!", show_alert=True)
+        await answer_callback_once(query, "Denied!", show_alert=True)
         return
 
-    await query.edit_message_text(f"🟡 <b>Starting {bot.name}...</b>", parse_mode="HTML")
+    await query.edit_message_text(f"🟡 <b>Starting {escape(bot.name, quote=False)}...</b>", parse_mode="HTML")
 
     success, msg = await process_mgr.deploy(bot, "")
     if success:
@@ -1740,7 +2021,7 @@ async def handle_start(query, bot_id: str, user_id: int, context: ContextTypes.D
             last_error=None,
         )
         await query.edit_message_text(
-            f"✅ <b>{bot.name} is LIVE!</b>\n\n{ui.code_block(msg)}",
+            f"✅ <b>{escape(bot.name, quote=False)} is LIVE!</b>\n\n{ui.code_block(msg)}",
             parse_mode="HTML",
             reply_markup=InlineKeyboardMarkup([[
                 InlineKeyboardButton("🔧 Manage", callback_data=f"nav_manage_{bot_id}")
@@ -1769,27 +2050,38 @@ async def handle_stop(query, bot_id: str, user_id: int):
     if not can_manage_bot(bot, user_id):
         return
 
-    await query.edit_message_text(f"🟡 <b>Stopping {bot.name}...</b>", parse_mode="HTML")
+    await query.edit_message_text(f"🟡 <b>Stopping {escape(bot.name, quote=False)}...</b>", parse_mode="HTML")
     success = await process_mgr.stop(bot_id)
 
     if success:
         db.update_bot(bot_id, status=BotStatus.STOPPED.value, pid=None)
         await query.edit_message_text(
-            f"⏹ <b>{bot.name} stopped.</b>",
+            f"⏹ <b>{escape(bot.name, quote=False)} stopped.</b>",
             parse_mode="HTML",
             reply_markup=InlineKeyboardMarkup([[
                 InlineKeyboardButton("🔧 Manage", callback_data=f"nav_manage_{bot_id}")
             ]])
         )
     else:
-        await query.answer("Failed to stop!", show_alert=True)
+        still_running = process_mgr.is_alive(bot_id)
+        db.update_bot(
+            bot_id,
+            status=BotStatus.RUNNING.value if still_running else BotStatus.ERROR.value,
+            pid=bot.pid if still_running else None,
+        )
+        await query.edit_message_text(
+            "❌ The service could not be stopped safely. No files were removed.",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("🔙 Back", callback_data=f"nav_manage_{bot_id}")
+            ]]),
+        )
 
 async def handle_restart(query, bot_id: str, user_id: int, context: ContextTypes.DEFAULT_TYPE):
     bot = db.get_bot(bot_id)
     if not can_manage_bot(bot, user_id):
         return
 
-    await query.edit_message_text(f"🔄 <b>Restarting {bot.name}...</b>", parse_mode="HTML")
+    await query.edit_message_text(f"🔄 <b>Restarting {escape(bot.name, quote=False)}...</b>", parse_mode="HTML")
     db.update_bot(bot_id, status=BotStatus.RESTARTING.value)
 
     success, msg = await process_mgr.restart(bot)
@@ -1830,7 +2122,7 @@ async def handle_restart(query, bot_id: str, user_id: int, context: ContextTypes
 async def handle_logs(query, bot_id: str, user_id: int):
     bot = db.get_bot(bot_id)
     if not can_manage_bot(bot, user_id):
-        await query.answer("Denied!", show_alert=True)
+        await answer_callback_once(query, "Denied!", show_alert=True)
         return
 
     logs = await log_streamer.tail(bot_id, Config.LOG_TAIL_LINES)
@@ -1840,7 +2132,7 @@ async def handle_logs(query, bot_id: str, user_id: int):
         await query.edit_message_text(text, parse_mode="HTML", 
                                       reply_markup=ui.log_actions(bot_id))
     except Exception:
-        await query.answer("Logs unchanged.")
+        await answer_callback_once(query, "Logs unchanged.")
 
 async def handle_live_logs(query, bot_id: str, user_id: int, context: ContextTypes.DEFAULT_TYPE):
     bot = db.get_bot(bot_id)
@@ -1886,25 +2178,26 @@ async def live_log_stream(context: ContextTypes.DEFAULT_TYPE, bot_id: str,
 async def handle_log_download(query, bot_id: str, user_id: int, context: ContextTypes.DEFAULT_TYPE):
     bot = db.get_bot(bot_id)
     if not can_manage_bot(bot, user_id):
-        await query.answer("Service not found or access denied.", show_alert=True)
         return
+    back_markup = InlineKeyboardMarkup([[
+        InlineKeyboardButton("🔙 Back", callback_data=f"nav_manage_{bot_id}")
+    ]])
     if not bot.log_file or not re.fullmatch(r"bot_[A-Za-z0-9_-]{3,80}", bot_id):
-        await query.answer("No log file!", show_alert=True)
+        await query.edit_message_text("❌ No log file is available for this service.", reply_markup=back_markup)
         return
     expected_log = (Config.LOGS_DIR / f"{bot_id}.log").resolve()
     log_path = Path(bot.log_file)
     try:
         if log_path.is_symlink() or log_path.resolve() != expected_log or not log_path.is_file():
-            await query.answer("The log file is unavailable or unsafe.", show_alert=True)
+            await query.edit_message_text("❌ The log file is unavailable or unsafe.", reply_markup=back_markup)
             return
         if log_path.stat().st_size > 20 * 1024 * 1024:
-            await query.answer("The log file exceeds the 20 MB Telegram upload limit.", show_alert=True)
+            await query.edit_message_text("❌ The log file exceeds Telegram's 20 MB upload limit.", reply_markup=back_markup)
             return
     except OSError:
-        await query.answer("The log file is unavailable.", show_alert=True)
+        await query.edit_message_text("❌ The log file is unavailable.", reply_markup=back_markup)
         return
 
-    await query.answer("Sending file...")
     await context.bot.send_document(
         chat_id=user_id,
         document=InputFile(str(log_path)),
@@ -1920,29 +2213,44 @@ async def set_mode(query, bot_id: str, mode: str, user_id: int):
 
     if mode == "maintenance":
         if not await process_mgr.stop(bot_id):
-            await query.answer("Could not stop the process safely.", show_alert=True)
+            await query.edit_message_text(
+                "❌ Could not stop the process safely; maintenance mode was not applied.",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("🔙 Back", callback_data=f"nav_manage_{bot_id}")
+                ]]),
+            )
             return
         db.update_bot(bot_id, mode=mode, status=BotStatus.MAINTENANCE.value, pid=None)
     else:
         db.update_bot(bot_id, mode=mode)
 
-    await query.answer(f"Mode set to {mode.upper()}!")
+    await answer_callback_once(query, f"Mode set to {mode.upper()}!")
     await show_bot_manage(query, bot_id, user_id)
 
 async def handle_git_pull(query, bot_id: str, user_id: int, context: ContextTypes.DEFAULT_TYPE):
     bot = db.get_bot(bot_id)
     if not can_manage_bot(bot, user_id):
-        await query.answer("Service not found or access denied.", show_alert=True)
+        await answer_callback_once(query, "Service not found or access denied.", show_alert=True)
         return
     try:
         bot.github_url = validate_github_repo_url(bot.github_url)
     except ValueError:
-        await query.answer("Stored repository URL is invalid; refusing to update it.", show_alert=True)
+        await query.edit_message_text(
+            "❌ Stored repository URL is invalid; refusing to update it.",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("🔙 Back", callback_data=f"nav_manage_{bot_id}")
+            ]]),
+        )
         return
 
     bot_dir = Config.REPOS_DIR / bot_id
     if bot_dir.is_symlink() or not bot_dir.is_dir():
-        await query.answer("Repository checkout not found or unsafe.", show_alert=True)
+        await query.edit_message_text(
+            "❌ Repository checkout not found or unsafe.",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("🔙 Back", callback_data=f"nav_manage_{bot_id}")
+            ]]),
+        )
         return
 
     await query.edit_message_text(f"🔄 <b>Updating {escape(bot.name, quote=False)}...</b>", parse_mode="HTML")
@@ -2112,23 +2420,25 @@ def create_bot_backup(bot_id: str, bot_dir: Path) -> Path:
 async def handle_backup(query, bot_id: str, user_id: int, context: ContextTypes.DEFAULT_TYPE):
     bot = db.get_bot(bot_id)
     if not can_manage_bot(bot, user_id):
-        await query.answer("Service not found or access denied.", show_alert=True)
+        await answer_callback_once(query, "Service not found or access denied.", show_alert=True)
         return
 
     bot_dir = Config.REPOS_DIR / bot_id
+    back_markup = InlineKeyboardMarkup([[
+        InlineKeyboardButton("🔙 Back", callback_data=f"nav_manage_{bot_id}")
+    ]])
     try:
         backup_path = await asyncio.to_thread(create_bot_backup, bot_id, bot_dir)
     except ValueError as exc:
-        await query.answer(str(exc), show_alert=True)
+        await query.edit_message_text(f"❌ Backup not created: {escape(str(exc)[:500], quote=False)}", reply_markup=back_markup)
         return
     except Exception:
         logger.exception("Backup creation failed for %s", bot_id)
-        await query.answer("Backup failed. Check the worker logs for details.", show_alert=True)
+        await query.edit_message_text("❌ Backup failed. Check the worker logs for details.", reply_markup=back_markup)
         return
 
     archive_size = backup_path.stat().st_size
     delivery = "Retained in the worker volume; it exceeds Telegram's 20 MiB upload limit."
-    await query.answer("Backup created!")
     if archive_size <= MAX_BACKUP_TELEGRAM_BYTES:
         try:
             await context.bot.send_document(
@@ -2161,7 +2471,12 @@ async def handle_delete(query, bot_id: str, user_id: int):
         return
 
     if not await process_mgr.stop(bot_id):
-        await query.answer("The process could not be stopped safely; nothing was deleted.", show_alert=True)
+        await query.edit_message_text(
+            "❌ The process could not be stopped safely; nothing was deleted.",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("🔙 Back", callback_data=f"nav_manage_{bot_id}")
+            ]]),
+        )
         return
 
     repo_dir = Config.REPOS_DIR / bot_id
@@ -2182,7 +2497,12 @@ async def handle_delete(query, bot_id: str, user_id: int):
                 shutil.rmtree(file_path)
     except OSError as exc:
         logger.exception("Could not fully remove service data for %s", bot_id)
-        await query.answer(f"Could not remove all service data: {str(exc)[:120]}", show_alert=True)
+        await query.edit_message_text(
+            f"❌ Could not remove all service data: {escape(str(exc)[:120], quote=False)}",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("🔙 Back", callback_data=f"nav_manage_{bot_id}")
+            ]]),
+        )
         return
 
     process_mgr.auto_heal_attempts.pop(bot_id, None)
@@ -2197,38 +2517,16 @@ async def handle_delete(query, bot_id: str, user_id: int):
         ]])
     )
 
-async def show_status(query):
-    stats = db.get_stats()
-    try:
-        uptime = subprocess.run(["uptime", "-p"], capture_output=True, text=True).stdout.strip()
-    except:
-        uptime = "N/A"
-    try:
-        disk = subprocess.run(["df", "-h", "/"], capture_output=True, text=True).stdout.strip().split('\n')[1]
-    except:
-        disk = "N/A"
-
-    text = (
-        f"<b>📊 SYSTEM STATUS</b>\n\n"
-        f"<b>Bot Statistics:</b>\n"
-        f"├ Total Hosted: <code>{stats['total']}</code>\n"
-        f"├ 🟢 Running: <code>{stats['running']}</code>\n"
-        f"├ ⏹ Stopped: <code>{stats['stopped']}</code>\n"
-        f"├ 🔴 Errors: <code>{stats['error']}</code>\n"
-        f"└ Users: <code>{stats['users']}</code>\n\n"
-        f"<b>Server:</b>\n"
-        f"├ Uptime: <code>{uptime}</code>\n"
-        f"└ Disk: <code>{disk}</code>\n\n"
-        f"{ui.blockquote('Auto-heal monitor is active. Checking every 15 seconds.')}"
-    )
-
+async def show_status(query, user_id: int):
     await query.edit_message_text(
-        text, parse_mode="HTML",
+        build_status_text(user_id),
+        parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup([[
             InlineKeyboardButton("🔄 Refresh", callback_data="nav_status"),
-            InlineKeyboardButton("🔙 Back", callback_data="nav_main")
-        ]])
+            InlineKeyboardButton("🔙 Back", callback_data="nav_main"),
+        ]]),
     )
+
 
 async def handle_cleanup(query, user_id: int):
     if user_id not in Config.ADMIN_IDS:
@@ -2240,33 +2538,77 @@ async def handle_cleanup(query, user_id: int):
             log_file.unlink()
             count += 1
 
-    await query.answer(f"Cleaned {count} old logs!")
+    await answer_callback_once(query, f"Cleaned {count} old logs!")
     await query.edit_message_text(
         f"🧹 <b>Cleanup complete</b>\n\nRemoved <code>{count}</code> expired log file(s).",
         parse_mode="HTML",
         reply_markup=ui.admin_panel(),
     )
 
-async def handle_restart_all(query, user_id: int):
+async def handle_restart_all(query, user_id: int, context: ContextTypes.DEFAULT_TYPE):
     if user_id not in Config.ADMIN_IDS:
         return
 
-    await query.edit_message_text("🔄 <b>Restarting all production bots...</b>", parse_mode="HTML")
-    bots = db.get_all_bots()
-    restarted = 0
-
-    for bot in bots:
-        if bot.mode == "production" and bot.status in ["running", "error"]:
-            success, _ = await process_mgr.restart(bot)
-            if success:
-                restarted += 1
-                db.update_bot(bot.bot_id, status="running")
+    bots = [
+        bot for bot in db.get_all_bots()
+        if bot.mode == BotMode.PRODUCTION.value and bot.status in {BotStatus.RUNNING.value, BotStatus.ERROR.value}
+    ]
+    if not bots:
+        await query.edit_message_text(
+            "No running or failed production services to restart.",
+            reply_markup=ui.admin_panel(),
+        )
+        return
 
     await query.edit_message_text(
-        f"✅ <b>Mass Restart Complete</b>\n\nRestarted: <code>{restarted}/{len(bots)}</code> bots.",
+        f"🔄 <b>Restarting {len(bots)} running or failed production services...</b>",
         parse_mode="HTML",
-        reply_markup=ui.admin_panel()
     )
+    succeeded = 0
+    failed = 0
+    results = []
+    for bot in bots:
+        success, message = await process_mgr.restart(bot)
+        if success:
+            succeeded += 1
+            db.update_bot(
+                bot.bot_id,
+                status=BotStatus.RUNNING.value,
+                pid=bot.pid,
+                log_file=bot.log_file,
+                restart_count=bot.restart_count + 1,
+                last_error=None,
+            )
+            results.append(f"🟢 {escape(bot.name, quote=False)}")
+        else:
+            failed += 1
+            still_running = process_mgr.is_alive(bot.bot_id)
+            db.update_bot(
+                bot.bot_id,
+                status=BotStatus.RUNNING.value if still_running else BotStatus.ERROR.value,
+                pid=bot.pid if still_running else None,
+                last_error=message[:200],
+            )
+            results.append(f"🔴 {escape(bot.name, quote=False)}")
+            await notify_admins_about_bot_failure(
+                context, bot, "Hosted bot restart-all operation failed", message
+            )
+
+    visible_results = results[:20]
+    omitted = len(results) - len(visible_results)
+    report = (
+        "<b>✅ MASS RESTART COMPLETE</b>\n\n"
+        f"Succeeded: <code>{succeeded}</code> · Failed: <code>{failed}</code>\n\n"
+        + "\n".join(visible_results)
+    )
+    if omitted:
+        report += f"\n…and {omitted} more service(s)."
+    await query.edit_message_text(
+        report,
+        parse_mode="HTML",
+        reply_markup=ui.admin_panel(),
+    )
+
 
 async def show_sysinfo(query):
     if query.from_user.id not in Config.ADMIN_IDS:
@@ -2388,7 +2730,7 @@ async def deploy_env(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def deploy_confirm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
+    await answer_callback_once(query)
     user_id = update.effective_user.id
 
     if query.data == "deploy_cancel":
@@ -2414,7 +2756,7 @@ async def deploy_confirm_callback(update: Update, context: ContextTypes.DEFAULT_
     )
 
     await query.edit_message_text(
-        f"🚀 <b>Deploying {new_bot.name}...</b>\n\n"
+        f"🚀 <b>Deploying {escape(new_bot.name, quote=False)}...</b>\n\n"
         f"{ui.blockquote('Cloning repo → Installing deps → Launching process...')}\n\n"
         f"<i>This takes 30-120 seconds...</i>",
         parse_mode="HTML"
@@ -2433,7 +2775,7 @@ async def deploy_confirm_callback(update: Update, context: ContextTypes.DEFAULT_
             msg = "The service started, but its database record could not be saved; the process was stopped."
     if success:
         await query.edit_message_text(
-            f"✅ <b>{new_bot.name} IS LIVE!</b>\n\n"
+            f"✅ <b>{escape(new_bot.name, quote=False)} IS LIVE!</b>\n\n"
             f"{ui.code_block(msg)}\n\n"
             f"{ui.blockquote('Your bot is now running in Production mode with auto-heal enabled.')}",
             parse_mode="HTML",
@@ -2548,24 +2890,43 @@ async def env_edit_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 async def broadcast_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if user_id not in Config.ADMIN_IDS:
+    if update.effective_user.id not in Config.ADMIN_IDS:
+        await update.effective_message.reply_text("⛔ Admin only.")
         return ConversationHandler.END
 
-    message = update.message.text
-    cursor = sqlite3.connect(str(Config.DB_PATH)).cursor()
-    cursor.execute("SELECT DISTINCT owner_id FROM bots")
-    users = [r[0] for r in cursor.fetchall()]
+    raw_message = (update.effective_message.text or "").strip()
+    if not raw_message:
+        await update.effective_message.reply_text("Please send a non-empty announcement.")
+        return ConversationHandler.END
+    if len(raw_message) > 3000:
+        await update.effective_message.reply_text("Announcements must be 3,000 characters or fewer. Please send a shorter message.")
+        return ConversationHandler.END
 
+    recipients = db.get_user_ids()
+    if not recipients:
+        await update.effective_message.reply_text("There are no registered service owners to notify.")
+        return ConversationHandler.END
+
+    # Escape user-authored text because broadcasts are sent with Telegram HTML parsing.
+    safe_message = escape(raw_message, quote=False)
     sent = 0
-    for uid in users:
+    failed = 0
+    for recipient_id in recipients:
         try:
-            await context.bot.send_message(uid, f"📢 <b>Announcement</b>\n\n{message}", parse_mode="HTML")
+            await context.bot.send_message(
+                recipient_id,
+                f"📢 <b>Announcement</b>\n\n{safe_message}",
+                parse_mode="HTML",
+            )
             sent += 1
         except Exception:
-            pass
+            failed += 1
+            logger.info("Broadcast delivery failed for Telegram user %s", recipient_id, exc_info=True)
+        await asyncio.sleep(0.05)
 
-    await update.message.reply_text(f"📢 Broadcast sent to {sent} users.")
+    await update.effective_message.reply_text(
+        f"📢 Broadcast finished: delivered to {sent}; failed for {failed}."
+    )
     return ConversationHandler.END
 
 # ═══════════════════════════════════════════════════════════════════
@@ -2640,6 +3001,19 @@ async def auto_heal_task(context: ContextTypes.DEFAULT_TYPE):
 # MAIN
 # ═══════════════════════════════════════════════════════════════════
 
+def _dedupe_bot_commands(commands: list[BotCommand]) -> list[BotCommand]:
+    result = []
+    seen = set()
+    for command in commands:
+        if not re.fullmatch(r"[a-z0-9_]{1,32}", command.command) or command.command in seen:
+            continue
+        seen.add(command.command)
+        result.append(BotCommand(command.command, command.description[:256]))
+        if len(result) >= 100:
+            break
+    return result
+
+
 def main():
     if not Config.BOT_TOKEN:
         raise RuntimeError("BOT_TOKEN is required. Set it in the environment before starting the worker.")
@@ -2648,12 +3022,36 @@ def main():
 
     async def post_init(application: Application):
         manager: PluginManager = application.bot_data["plugin_manager"]
-        await application.bot.set_my_commands([
+        core_commands = [
             BotCommand("start", "🚀 Open main menu"),
-            BotCommand("logs", "📜 View bot logs (/logs <id> [lines])"),
-            BotCommand("cancel", "❌ Cancel operation"),
-            *manager.bot_commands(),
+            BotCommand("help", "Show available commands"),
+            BotCommand("status", "Show your service status"),
+            BotCommand("id", "Show your Telegram user ID"),
+            BotCommand("logs", "View recent service logs"),
+            BotCommand("cancel", "Cancel the current wizard"),
+        ]
+        default_commands = _dedupe_bot_commands([
+            *core_commands,
+            *manager.bot_commands(include_admin=False),
         ])
+        await application.bot.set_my_commands(
+            default_commands,
+            scope=BotCommandScopeDefault(),
+        )
+
+        admin_commands = _dedupe_bot_commands([
+            *core_commands,
+            *manager.bot_commands(include_admin=True),
+        ])
+        for admin_id in Config.ADMIN_IDS:
+            try:
+                await application.bot.set_my_commands(
+                    admin_commands,
+                    scope=BotCommandScopeChat(chat_id=admin_id),
+                )
+            except Exception:
+                logger.warning("Could not set the admin command menu for %s", admin_id, exc_info=True)
+
         await manager.startup()
         health_server.set_ready(True)
         logger.info("Telegram application is ready")
@@ -2684,6 +3082,7 @@ def main():
         process_mgr=process_mgr,
         log_streamer=log_streamer,
         ui=ui,
+        failure_notifier=notify_admins_about_bot_failure,
     )
     plugin_manager = PluginManager(application, plugin_context)
     application.bot_data["plugin_context"] = plugin_context
@@ -2716,11 +3115,15 @@ def main():
     )
 
     application.add_handler(CommandHandler("start", cmd_start))
+    application.add_handler(CommandHandler("help", cmd_help))
+    application.add_handler(CommandHandler("status", cmd_status))
+    application.add_handler(CommandHandler("id", cmd_user_id))
     application.add_handler(CommandHandler("logs", cmd_logs))
     application.add_handler(deploy_conv)
     application.add_handler(env_conv)
     application.add_handler(broadcast_conv)
     application.add_handler(CallbackQueryHandler(callback_router))
+    application.add_error_handler(telegram_error_handler)
 
     application.job_queue.run_repeating(
         auto_heal_task,

@@ -13,6 +13,7 @@ class DiagnosticsPlugin(BotPlugin):
         version="1.0.0",
         description="Health, plugin inventory, and host statistics.",
         commands=(("health", "Run host health checks"), ("plugins", "List loaded plugins"), ("stats", "Show host statistics")),
+        admin_commands=("stats",),
     )
 
     def __init__(self) -> None:
@@ -31,6 +32,9 @@ class DiagnosticsPlugin(BotPlugin):
     async def health_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         manager = context.bot_data["plugin_manager"]
         report = await manager.health_report()
+        is_admin = self.context is not None and update.effective_user.id in self.context.config.ADMIN_IDS
+        visible_names = {item["name"] for item in manager.catalog(include_admin=is_admin)}
+        report = [item for item in report if item["name"] in visible_names]
         healthy = sum(1 for item in report if item["ok"])
         lines = ["<b>🩺 HOST HEALTH</b>", ""]
         for item in report:
@@ -41,8 +45,9 @@ class DiagnosticsPlugin(BotPlugin):
 
     async def plugins_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         manager = context.bot_data["plugin_manager"]
+        is_admin = self.context is not None and update.effective_user.id in self.context.config.ADMIN_IDS
         lines = ["<b>🧩 LOADED PLUGINS</b>", ""]
-        for item in manager.catalog():
+        for item in manager.catalog(include_admin=is_admin):
             status = "🟢 enabled" if item["enabled"] else f"🔴 disabled: {escape(str(item['error']))}"
             commands = ", ".join(f"/{command}" for command in item["commands"]) or "no commands"
             lines.append(f"<b>{escape(item['name'])}</b> <code>v{escape(item['version'])}</code>\n{escape(item['description'])}\n{status} · {escape(commands)}\n")
@@ -50,7 +55,10 @@ class DiagnosticsPlugin(BotPlugin):
 
     async def stats_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if self.context is None:
-            await update.message.reply_text("Diagnostics are still starting. Try again in a moment.")
+            await update.effective_message.reply_text("Diagnostics are still starting. Try again in a moment.")
+            return
+        if update.effective_user.id not in self.context.config.ADMIN_IDS:
+            await update.effective_message.reply_text("⛔ Admin access required.")
             return
         stats = self.context.db.get_stats()
         await update.message.reply_html(
@@ -65,8 +73,7 @@ class DiagnosticsPlugin(BotPlugin):
     async def health(self) -> tuple[bool, str]:
         if self.context is None:
             return False, "context not initialized"
-        stats = self.context.db.get_stats()
-        return True, f"{stats['total']} services registered"
+        return True, "diagnostics ready"
 
 
 def create_plugin() -> BotPlugin:

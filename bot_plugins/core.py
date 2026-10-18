@@ -11,6 +11,7 @@ from __future__ import annotations
 import importlib
 import logging
 import os
+import re
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Iterable, Optional, Protocol
 
@@ -28,6 +29,7 @@ class PluginContext(Protocol):
     process_mgr: Any
     log_streamer: Any
     ui: Any
+    failure_notifier: Any
 
 
 HealthCheck = Callable[[], Awaitable[tuple[bool, str]]]
@@ -40,6 +42,7 @@ class PluginSpec:
     description: str
     commands: tuple[tuple[str, str], ...] = ()
     admin_only: bool = False
+    admin_commands: tuple[str, ...] = ()
 
 
 class BotPlugin:
@@ -137,25 +140,45 @@ class PluginManager:
             except Exception:
                 logger.exception("Shutdown hook failed for plugin %s", loaded.module_name)
 
-    def bot_commands(self) -> list[BotCommand]:
+    def bot_commands(self, include_admin: bool = True) -> list[BotCommand]:
         commands: list[BotCommand] = []
+        seen: set[str] = set()
         for loaded in self.loaded:
-            if loaded.enabled:
-                commands.extend(BotCommand(command, description) for command, description in loaded.plugin.spec.commands)
+            if not loaded.enabled or (loaded.plugin.spec.admin_only and not include_admin):
+                continue
+            for command, description in loaded.plugin.spec.commands:
+                if (
+                    (not include_admin and command in loaded.plugin.spec.admin_commands)
+                    or not re.fullmatch(r"[a-z0-9_]{1,32}", command)
+                    or command in seen
+                ):
+                    continue
+                seen.add(command)
+                safe_description = " ".join(description.split())[:256] or "Plugin command"
+                commands.append(BotCommand(command, safe_description))
+                if len(commands) >= 100:
+                    return commands
         return commands
 
-    def catalog(self) -> list[dict[str, Any]]:
-        return [
-            {
-                "name": loaded.plugin.spec.name,
+    def catalog(self, include_admin: bool = True) -> list[dict[str, Any]]:
+        catalog = []
+        for loaded in self.loaded:
+            if not include_admin and loaded.plugin.spec.admin_only:
+                continue
+            commands = [
+                command
+                for command, _ in loaded.plugin.spec.commands
+                if include_admin or command not in loaded.plugin.spec.admin_commands
+            ]
+            catalog.append({
+                "name": loaded.plugin.spec.name if loaded.enabled else loaded.module_name,
                 "version": loaded.plugin.spec.version,
                 "description": loaded.plugin.spec.description,
-                "commands": [command for command, _ in loaded.plugin.spec.commands],
+                "commands": commands,
                 "enabled": loaded.enabled,
                 "error": loaded.error,
-            }
-            for loaded in self.loaded
-        ]
+            })
+        return catalog
 
     async def health_report(self) -> list[dict[str, Any]]:
         report: list[dict[str, Any]] = []

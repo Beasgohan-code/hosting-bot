@@ -477,8 +477,7 @@ class KeepAlivePlugin(BotPlugin):
     async def health(self) -> tuple[bool, str]:
         if self.context is None:
             return False, "keep-alive monitor not initialized"
-        count = len(self.context.db.get_keepalives())
-        return True, f"scheduler ready · {count} monitors"
+        return True, "scheduler ready"
 
     @staticmethod
     def _help_text() -> str:
