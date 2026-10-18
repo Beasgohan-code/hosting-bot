@@ -4,7 +4,8 @@ FROM node:22-bookworm-slim AS build
 WORKDIR /app
 
 COPY package.json package-lock.json ./
-RUN --mount=type=cache,target=/root/.npm npm ci
+# BuildKit can run these stages concurrently, so give each its own npm cache.
+RUN --mount=type=cache,id=hosting-bot-build-npm,target=/root/.npm npm ci
 
 COPY . .
 RUN npm run build
@@ -16,8 +17,7 @@ ENV NODE_ENV=production \
 WORKDIR /app
 
 COPY package.json package-lock.json ./
-RUN --mount=type=cache,target=/root/.npm npm ci --omit=dev \
-    && npm cache clean --force \
+RUN --mount=type=cache,id=hosting-bot-runtime-npm,target=/root/.npm npm ci --omit=dev \
     && mkdir -p /var/lib/hosting-bot \
     && chown -R node:node /var/lib/hosting-bot /app
 
