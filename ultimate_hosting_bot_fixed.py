@@ -15,9 +15,15 @@ import time
 import asyncio
 import sqlite3
 import logging
+import re
 import shutil
+import signal
+import stat
 import subprocess
 import uuid
+import zipfile
+from urllib.parse import urlsplit
+from html import escape
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from threading import Thread
 from pathlib import Path
@@ -48,7 +54,7 @@ class Config:
     ADMIN_IDS: List[int] = [int(value.strip()) for value in os.getenv("ADMIN_IDS", "").split(",") if value.strip().isdigit()]
 
     # Auto-detect base dir: uses ./hosting_data in same folder as script
-    BASE_DIR: Path = Path(__file__).parent / "hosting_data"
+    BASE_DIR: Path = Path(os.getenv("HOSTING_DATA_DIR", str(Path(__file__).parent / "hosting_data"))).expanduser().resolve()
     LOGS_DIR: Path = BASE_DIR / "logs"
     REPOS_DIR: Path = BASE_DIR / "repos"
     BACKUPS_DIR: Path = BASE_DIR / "backups"
@@ -67,11 +73,21 @@ class Config:
 
     @classmethod
     def init_dirs(cls):
-        for d in [cls.BASE_DIR, cls.LOGS_DIR, cls.REPOS_DIR, cls.BACKUPS_DIR]:
-            d.mkdir(parents=True, exist_ok=True)
+        for directory in (cls.BASE_DIR, cls.LOGS_DIR, cls.REPOS_DIR, cls.BACKUPS_DIR):
+            directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+            try:
+                directory.chmod(0o700)
+            except OSError:
+                pass
 
 # Create dirs FIRST before logging tries to write there
 Config.init_dirs()
+MAX_PROCESS_LOG_BYTES = 10 * 1024 * 1024
+PROCESS_LOG_BACKUPS = 3
+MAX_BACKUP_INPUT_BYTES = 100 * 1024 * 1024
+MAX_BACKUP_FILES = 20_000
+MAX_BACKUPS_PER_BOT = 5
+MAX_BACKUP_TELEGRAM_BYTES = 20 * 1024 * 1024
 
 # ═══════════════════════════════════════════════════════════════════
 # LOGGING SETUP
@@ -201,7 +217,13 @@ class HostedBot:
 
 class Database:
     def __init__(self):
-        self.conn = sqlite3.connect(str(Config.DB_PATH), check_same_thread=False)
+        self.conn = sqlite3.connect(str(Config.DB_PATH), check_same_thread=False, timeout=10)
+        self.conn.execute("PRAGMA journal_mode=WAL")
+        self.conn.execute("PRAGMA synchronous=NORMAL")
+        try:
+            Config.DB_PATH.chmod(0o600)
+        except OSError:
+            pass
         self._init_tables()
 
     def _init_tables(self):
@@ -266,7 +288,10 @@ class Database:
             bot.env_vars, bot.resource_usage, bot.last_error, bot.restart_count
         ))
         self.conn.commit()
-        self._audit(bot.bot_id, bot.owner_id, "CREATE", f"Deployed {bot.name}")
+        if bot.status == BotStatus.RUNNING.value:
+            self._audit(bot.bot_id, bot.owner_id, "CREATE", f"Deployed {bot.name}")
+        else:
+            self._audit(bot.bot_id, bot.owner_id, "DEPLOY_FAILED", f"Deployment failed for {bot.name}")
 
     def update_bot(self, bot_id: str, **kwargs):
         allowed = {
@@ -383,7 +408,181 @@ class Database:
         """, (bot_id, user_id, action, datetime.now().isoformat(), details))
         self.conn.commit()
 
+    def close(self) -> None:
+        self.conn.close()
+
 db = Database()
+
+
+def can_manage_bot(bot: Optional[HostedBot], user_id: int) -> bool:
+    return bot is not None and (bot.owner_id == user_id or user_id in Config.ADMIN_IDS)
+
+
+def validate_github_repo_url(raw_url: str) -> str:
+    if not isinstance(raw_url, str) or len(raw_url) > 2048:
+        raise ValueError("GitHub repository URL is invalid or too long.")
+    try:
+        parsed = urlsplit(raw_url.strip())
+        port = parsed.port
+    except ValueError as exc:
+        raise ValueError("GitHub repository URL is invalid.") from exc
+    if (
+        parsed.scheme.lower() != "https"
+        or (parsed.hostname or "").lower().rstrip(".") != "github.com"
+        or parsed.username
+        or parsed.password
+        or port not in (None, 443)
+        or parsed.query
+        or parsed.fragment
+        or "%" in parsed.path
+    ):
+        raise ValueError("Use a public HTTPS GitHub repository URL without credentials, query strings, or fragments.")
+
+    parts = [part for part in parsed.path.strip("/").split("/") if part]
+    if len(parts) != 2:
+        raise ValueError("Use a GitHub repository URL in the form https://github.com/owner/repository.")
+    owner, repository = parts
+    if repository.endswith(".git"):
+        repository = repository[:-4]
+    name_pattern = re.compile(r"^[A-Za-z0-9_.-]{1,100}$")
+    if not name_pattern.fullmatch(owner) or not name_pattern.fullmatch(repository) or repository in {".", ".."}:
+        raise ValueError("The GitHub owner or repository name is invalid.")
+    return f"https://github.com/{owner}/{repository}.git"
+
+
+def _validate_deployment_env(raw: str, password: str = "") -> dict[str, str]:
+    try:
+        parsed = json.loads(raw) if raw else {}
+    except (TypeError, json.JSONDecodeError) as exc:
+        raise ValueError("Stored environment variables are invalid JSON.") from exc
+    if not isinstance(parsed, dict) or len(parsed) > 100:
+        raise ValueError("Environment must be an object with no more than 100 variables.")
+
+    env: dict[str, str] = {}
+    total_bytes = 0
+    for key, value in parsed.items():
+        if not isinstance(key, str) or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,127}", key):
+            raise ValueError("Environment variable names must use letters, digits, and underscores.")
+        if key in {"HOME", "PATH", "BOT_ID"}:
+            raise ValueError(f"Environment variable {key} is reserved by the worker.")
+        if not isinstance(value, str) or any(char in value for char in ("\x00", "\n", "\r")):
+            raise ValueError(f"Environment variable {key} must be a single-line string.")
+        if len(value.encode("utf-8")) > 8192:
+            raise ValueError(f"Environment variable {key} exceeds the 8 KB limit.")
+        env[key] = value
+        total_bytes += len(key) + len(value.encode("utf-8"))
+    if password:
+        if any(char in password for char in ("\x00", "\n", "\r")) or len(password.encode("utf-8")) > 8192:
+            raise ValueError("Deployment password must be a single-line value no longer than 8 KB.")
+        env["DEPLOY_PASSWORD"] = password
+        total_bytes += len("DEPLOY_PASSWORD") + len(password.encode("utf-8"))
+    if total_bytes > 64 * 1024:
+        raise ValueError("Combined environment variables exceed the 64 KB limit.")
+    return env
+
+
+def _minimal_child_environment(home: Path) -> dict[str, str]:
+    home.mkdir(parents=True, exist_ok=True, mode=0o700)
+    try:
+        home.chmod(0o700)
+    except OSError:
+        pass
+    return {
+        "PATH": "/usr/local/bin:/usr/local/sbin:/usr/bin:/usr/sbin:/bin:/sbin",
+        "HOME": str(home),
+        "LANG": "C.UTF-8",
+        "LC_ALL": "C.UTF-8",
+        "PYTHONUNBUFFERED": "1",
+        "PYTHONDONTWRITEBYTECODE": "1",
+        "PIP_CONFIG_FILE": os.devnull,
+        "PIP_NO_INPUT": "1",
+        "PIP_NO_CACHE_DIR": "1",
+        "PIP_DISABLE_PIP_VERSION_CHECK": "1",
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_CONFIG_GLOBAL": os.devnull,
+        "GIT_TERMINAL_PROMPT": "0",
+    }
+
+
+async def _read_capped_stream(stream, limit: int = 1024 * 1024) -> bytes:
+    output = bytearray()
+    while True:
+        chunk = await stream.read(64 * 1024)
+        if not chunk:
+            return bytes(output)
+        output.extend(chunk)
+        if len(output) > limit:
+            del output[:len(output) - limit]
+
+
+async def _terminate_command_group(process) -> None:
+    pgid = process.pid
+
+    def group_exists() -> bool:
+        try:
+            os.killpg(pgid, 0)
+            return True
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+
+    try:
+        os.killpg(pgid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+    except OSError:
+        try:
+            process.terminate()
+        except ProcessLookupError:
+            pass
+
+    deadline = time.monotonic() + 2
+    while group_exists() and time.monotonic() < deadline:
+        await asyncio.sleep(0.1)
+    if group_exists():
+        try:
+            os.killpg(pgid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        except OSError:
+            try:
+                process.kill()
+            except ProcessLookupError:
+                pass
+    try:
+        await asyncio.wait_for(process.wait(), timeout=3)
+    except asyncio.TimeoutError:
+        try:
+            os.killpg(pgid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        await process.wait()
+
+
+async def _run_bounded_command(command: list[str], cwd: Path, env: dict[str, str], timeout: int):
+    process = await asyncio.create_subprocess_exec(
+        *command,
+        cwd=str(cwd),
+        env=env,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        start_new_session=True,
+    )
+    stdout_task = asyncio.create_task(_read_capped_stream(process.stdout))
+    stderr_task = asyncio.create_task(_read_capped_stream(process.stderr))
+    try:
+        await asyncio.wait_for(process.wait(), timeout=timeout)
+        stdout, stderr = await asyncio.wait_for(asyncio.gather(stdout_task, stderr_task), timeout=3)
+    except (asyncio.TimeoutError, asyncio.CancelledError):
+        await _terminate_command_group(process)
+        for task in (stdout_task, stderr_task):
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(stdout_task, stderr_task, return_exceptions=True)
+        raise
+    return process.returncode, stdout, stderr
+
 
 # ═══════════════════════════════════════════════════════════════════
 # PROCESS MANAGER
@@ -392,7 +591,9 @@ db = Database()
 class ProcessManager:
     def __init__(self):
         self.processes: Dict[str, subprocess.Popen] = {}
+        self.log_threads: Dict[str, Thread] = {}
         self._lock = asyncio.Lock()
+        self._deploying: set[str] = set()
         self.auto_heal_attempts: Dict[str, deque[float]] = defaultdict(deque)
 
     def begin_auto_heal(self, bot_id: str) -> tuple[bool, int]:
@@ -405,123 +606,496 @@ class ProcessManager:
         attempts.append(now)
         return True, len(attempts)
 
+    @staticmethod
+    def _safe_bot_id(bot_id: str) -> bool:
+        return bool(re.fullmatch(r"bot_[A-Za-z0-9_-]{3,80}", bot_id))
+
+    @staticmethod
+    def _group_exists(pgid: int) -> bool:
+        try:
+            os.killpg(pgid, 0)
+            return True
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+
+    async def _terminate_process_group(self, pgid: int, process: Optional[subprocess.Popen] = None) -> bool:
+        try:
+            os.killpg(pgid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        except OSError as exc:
+            logger.warning("Could not signal process group %s: %s", pgid, exc)
+            return False
+
+        deadline = time.monotonic() + 2
+        while self._group_exists(pgid) and time.monotonic() < deadline:
+            await asyncio.sleep(0.1)
+        if self._group_exists(pgid):
+            try:
+                os.killpg(pgid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            except OSError as exc:
+                logger.warning("Could not force-stop process group %s: %s", pgid, exc)
+                return False
+
+        if process is not None:
+            try:
+                await asyncio.to_thread(process.wait, timeout=3)
+            except subprocess.TimeoutExpired:
+                return False
+        return not self._group_exists(pgid)
+
+    def _verified_persisted_process(self, bot: HostedBot) -> bool:
+        if not bot.pid or bot.pid <= 1 or not self._safe_bot_id(bot.bot_id):
+            return False
+        try:
+            if os.getpgid(bot.pid) != bot.pid:
+                return False
+            expected_dir = (Config.REPOS_DIR / bot.bot_id).resolve()
+            current_dir = Path(f"/proc/{bot.pid}/cwd").resolve(strict=True)
+            command_line = Path(f"/proc/{bot.pid}/cmdline").read_bytes().decode("utf-8", errors="replace")
+            return current_dir == expected_dir and f"{expected_dir}/" in command_line and ".py" in command_line
+        except (OSError, ProcessLookupError, PermissionError):
+            return False
+
+    @staticmethod
+    def _rotate_process_log(log_file: Path) -> None:
+        if log_file.is_symlink():
+            log_file.unlink()
+        for index in range(PROCESS_LOG_BACKUPS, 0, -1):
+            source = log_file if index == 1 else Path(f"{log_file}.{index - 1}")
+            destination = Path(f"{log_file}.{index}")
+            if destination.exists() or destination.is_symlink():
+                if destination.is_dir() and not destination.is_symlink():
+                    shutil.rmtree(destination)
+                else:
+                    destination.unlink()
+            if source.is_symlink():
+                source.unlink()
+            elif source.is_file():
+                os.replace(source, destination)
+
+    def _stream_process_log(self, bot_id: str, process: subprocess.Popen, log_file: Path) -> None:
+        stream = process.stdout
+        if stream is None:
+            return
+        handle = None
+        size = 0
+        try:
+            if log_file.is_symlink():
+                log_file.unlink()
+            if log_file.exists() and log_file.stat().st_size >= MAX_PROCESS_LOG_BYTES:
+                self._rotate_process_log(log_file)
+            flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND | getattr(os, "O_NOFOLLOW", 0)
+            descriptor = os.open(log_file, flags, 0o600)
+            handle = os.fdopen(descriptor, "ab", buffering=0)
+            size = log_file.stat().st_size
+            while True:
+                chunk = stream.read(8192)
+                if not chunk:
+                    break
+                if handle is None:
+                    continue
+                try:
+                    if size and size + len(chunk) > MAX_PROCESS_LOG_BYTES:
+                        handle.close()
+                        self._rotate_process_log(log_file)
+                        descriptor = os.open(log_file, flags, 0o600)
+                        handle = os.fdopen(descriptor, "ab", buffering=0)
+                        size = 0
+                    handle.write(chunk)
+                    size += len(chunk)
+                except OSError:
+                    logger.exception("Could not write logs for %s; continuing to drain output", bot_id)
+                    if handle:
+                        handle.close()
+                        handle = None
+        except OSError:
+            logger.exception("Could not open logs for %s; continuing to drain output", bot_id)
+            while stream.read(8192):
+                pass
+        finally:
+            if handle is not None:
+                handle.close()
+            stream.close()
+
+    async def _join_log_thread(self, bot_id: str) -> None:
+        thread = self.log_threads.pop(bot_id, None)
+        if thread is not None and thread.is_alive():
+            await asyncio.to_thread(thread.join, 3)
+
     async def deploy(self, bot: HostedBot, password: str = "") -> tuple[bool, str]:
+        if not self._safe_bot_id(bot.bot_id):
+            return False, "Invalid service identifier."
+        try:
+            repo_url = validate_github_repo_url(bot.github_url)
+            env_dict = _validate_deployment_env(bot.env_vars, password)
+        except ValueError as exc:
+            return False, str(exc)
+
+        stale_process: Optional[subprocess.Popen] = None
+        async with self._lock:
+            if bot.bot_id in self._deploying:
+                return False, "A deployment is already in progress for this service."
+            current_process = self.processes.get(bot.bot_id)
+            if current_process and current_process.poll() is None:
+                return False, "This service is already running. Stop or restart it first."
+            stale_process = current_process
+            self._deploying.add(bot.bot_id)
+
         bot_dir = Config.REPOS_DIR / bot.bot_id
         log_file = Config.LOGS_DIR / f"{bot.bot_id}.log"
+        bot.log_file = str(log_file)
+        staging_dir = Config.REPOS_DIR / f".{bot.bot_id}.stage-{uuid.uuid4().hex[:10]}"
+        build_home = Config.REPOS_DIR / f".{bot.bot_id}.home-{uuid.uuid4().hex[:10]}"
+        backup_dir = Config.REPOS_DIR / f".{bot.bot_id}.backup-{uuid.uuid4().hex[:10]}"
+        moved_old_repo = False
+        installed_new_repo = False
+        successful = False
+        launch_process: Optional[subprocess.Popen] = None
 
         try:
-            if bot_dir.exists():
-                shutil.rmtree(bot_dir)
+            if stale_process is not None:
+                if not await self._terminate_process_group(stale_process.pid, stale_process):
+                    return False, "A previous process group could not be stopped safely."
+                await self._join_log_thread(bot.bot_id)
+                async with self._lock:
+                    if self.processes.get(bot.bot_id) is stale_process:
+                        self.processes.pop(bot.bot_id, None)
+            if bot.pid and self._verified_persisted_process(bot):
+                return False, "This service is already running. Stop or restart it first."
+            Config.REPOS_DIR.mkdir(parents=True, exist_ok=True)
+            Config.LOGS_DIR.mkdir(parents=True, exist_ok=True)
 
-            proc = await asyncio.create_subprocess_exec(
-                "git", "clone", bot.github_url, str(bot_dir),
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE
+            build_env = _minimal_child_environment(build_home)
+            code, stdout, stderr = await _run_bounded_command(
+                ["git", "clone", "--depth", "1", "--no-tags", "--", repo_url, str(staging_dir)],
+                Config.REPOS_DIR,
+                build_env,
+                timeout=60,
             )
-            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=60)
+            if code != 0:
+                detail = (stderr or stdout).decode("utf-8", errors="replace")[-2000:]
+                return False, f"Git clone failed:\n{detail or 'Git exited unsuccessfully.'}"
 
-            if proc.returncode != 0:
-                return False, f"Git clone failed:\n{stderr.decode()[:500]}"
+            env_path = staging_dir / ".env"
+            if env_path.is_symlink():
+                env_path.unlink()
+            elif env_path.exists() and not env_path.is_file():
+                return False, "The repository contains an invalid .env path."
+            flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0)
+            descriptor = os.open(env_path, flags, 0o600)
+            with os.fdopen(descriptor, "w", encoding="utf-8") as env_file:
+                for key, value in env_dict.items():
+                    env_file.write(f"{key}={value}\n")
+            try:
+                env_path.chmod(0o600)
+            except OSError:
+                pass
 
-            env_dict = json.loads(bot.env_vars) if bot.env_vars else {}
-            if password:
-                env_dict["DEPLOY_PASSWORD"] = password
-
-            env_path = bot_dir / ".env"
-            with open(env_path, "w") as f:
-                for k, v in env_dict.items():
-                    f.write(f"{k}={v}\n")
-
-            venv_dir = bot_dir / ".venv"
-            venv_python = venv_dir / "bin" / "python"
-
-            setup_cmds = [
+            venv_dir = staging_dir / ".venv"
+            if venv_dir.is_symlink():
+                venv_dir.unlink()
+            elif venv_dir.exists():
+                shutil.rmtree(venv_dir)
+            code, _stdout, stderr = await _run_bounded_command(
                 [sys.executable, "-m", "venv", str(venv_dir)],
-                [str(venv_dir / "bin" / "pip"), "install", "--upgrade", "pip"],
-            ]
+                staging_dir,
+                build_env,
+                timeout=30,
+            )
+            if code != 0:
+                return False, f"Python environment setup failed:\n{stderr.decode('utf-8', errors='replace')[-2000:]}"
 
-            req_file = bot_dir / "requirements.txt"
-            if req_file.exists():
-                setup_cmds.append([str(venv_dir / "bin" / "pip"), "install", "-r", str(req_file)])
-
-            for cmd in setup_cmds:
-                proc = await asyncio.create_subprocess_exec(
-                    *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-                    cwd=str(bot_dir)
+            req_file = staging_dir / "requirements.txt"
+            if req_file.is_symlink():
+                return False, "Symlinked requirements.txt files are not allowed."
+            if req_file.is_file():
+                code, _stdout, stderr = await _run_bounded_command(
+                    [str(venv_dir / "bin" / "python"), "-m", "pip", "install", "--disable-pip-version-check", "--no-input", "--requirement", str(req_file)],
+                    staging_dir,
+                    build_env,
+                    timeout=Config.DEPLOY_TIMEOUT,
                 )
-                _, stderr = await asyncio.wait_for(proc.communicate(), timeout=Config.DEPLOY_TIMEOUT)
-                if proc.returncode != 0:
-                    return False, f"Setup failed ({cmd[0]}):\n{stderr.decode()[:500]}"
+                if code != 0:
+                    return False, f"Dependency installation failed:\n{stderr.decode('utf-8', errors='replace')[-2000:]}"
 
-            entry_point = bot_dir / "main.py"
-            if not entry_point.exists():
-                py_files = list(bot_dir.glob("*.py"))
-                if not py_files:
-                    return False, "No Python entry point found in repo!"
+            entry_point = next((staging_dir / name for name in ("main.py", "bot.py", "app.py", "run.py") if (staging_dir / name).is_file() and not (staging_dir / name).is_symlink()), None)
+            if entry_point is None:
+                py_files = sorted(file for file in staging_dir.glob("*.py") if file.is_file() and not file.is_symlink())
+                if len(py_files) != 1:
+                    return False, "Add a main.py entry point, or include exactly one root-level Python file."
                 entry_point = py_files[0]
+            entry_relative = entry_point.relative_to(staging_dir)
 
-            with open(log_file, "a", encoding="utf-8") as log_handle:
-                log_handle.write(f"\n\n=== DEPLOY {datetime.now()} ===\n")
-                log_handle.flush()
-                process = subprocess.Popen(
-                    [str(venv_python), str(entry_point)],
-                    cwd=str(bot_dir),
-                    stdout=log_handle,
-                    stderr=subprocess.STDOUT,
-                    env={**os.environ, **env_dict},
-                    preexec_fn=os.setsid,
-                )
+            if bot_dir.is_symlink():
+                bot_dir.unlink()
+            elif bot_dir.exists():
+                os.replace(bot_dir, backup_dir)
+                moved_old_repo = True
+            os.replace(staging_dir, bot_dir)
+            installed_new_repo = True
+
+            bot_home_root = Config.BASE_DIR / "bot_homes"
+            if bot_home_root.is_symlink():
+                return False, "The service home directory is not safe to use."
+            bot_home_root.mkdir(parents=True, exist_ok=True, mode=0o700)
+            bot_home = bot_home_root / bot.bot_id
+            if bot_home.is_symlink() or (bot_home.exists() and not bot_home.is_dir()):
+                bot_home.unlink()
+            run_env = _minimal_child_environment(bot_home)
+            run_env.update(env_dict)
+            run_env["BOT_ID"] = bot.bot_id
+            run_env["HOME"] = str(bot_home)
+            run_env["PATH"] = "/usr/local/bin:/usr/local/sbin:/usr/bin:/usr/sbin:/bin:/sbin"
+            launch_process = subprocess.Popen(
+                [str(bot_dir / ".venv" / "bin" / "python"), str(bot_dir / entry_relative)],
+                cwd=str(bot_dir),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                env=run_env,
+                start_new_session=True,
+                close_fds=True,
+                bufsize=0,
+            )
+            log_thread = Thread(
+                target=self._stream_process_log,
+                args=(bot.bot_id, launch_process, log_file),
+                name=f"service-log-{bot.bot_id}",
+                daemon=True,
+            )
+            self.log_threads[bot.bot_id] = log_thread
+            log_thread.start()
+            async with self._lock:
+                self.processes[bot.bot_id] = launch_process
 
             await asyncio.sleep(3)
-            if process.poll() is not None:
-                return False, "Bot crashed immediately after start. Check logs."
-
             async with self._lock:
-                self.processes[bot.bot_id] = process
+                still_registered = self.processes.get(bot.bot_id) is launch_process
+            if not still_registered:
+                return False, "The deployment was stopped before startup completed."
+            if launch_process.poll() is not None:
+                return False, "The service exited during startup. Check its logs."
 
-            bot.pid = process.pid
+            bot.github_url = repo_url
+            bot.pid = launch_process.pid
             bot.log_file = str(log_file)
             bot.status = BotStatus.RUNNING.value
             bot.last_error = None
-
-            return True, f"Deployed!\nPID: {process.pid}\nEntry: {entry_point.name}"
+            successful = True
+            return True, f"Deployed!\nPID: {launch_process.pid}\nEntry: {entry_relative.name}"
 
         except asyncio.TimeoutError:
-            return False, "Deployment timed out (>120s)."
-        except Exception as e:
-            return False, f"Deployment error: {str(e)}"
+            return False, f"Deployment timed out (limit {Config.DEPLOY_TIMEOUT}s)."
+        except Exception as exc:
+            logger.exception("Deployment failed for %s", bot.bot_id)
+            return False, f"Deployment error: {str(exc)[:500]}"
+        finally:
+            if not successful:
+                if launch_process is not None:
+                    await self._terminate_process_group(launch_process.pid, launch_process)
+                    await self._join_log_thread(bot.bot_id)
+                    async with self._lock:
+                        if self.processes.get(bot.bot_id) is launch_process:
+                            self.processes.pop(bot.bot_id, None)
+                if installed_new_repo and (bot_dir.exists() or bot_dir.is_symlink()):
+                    try:
+                        if bot_dir.is_symlink():
+                            bot_dir.unlink()
+                        else:
+                            shutil.rmtree(bot_dir)
+                    except OSError:
+                        logger.exception("Could not remove failed deployment directory for %s", bot.bot_id)
+                if moved_old_repo and backup_dir.exists():
+                    try:
+                        os.replace(backup_dir, bot_dir)
+                    except OSError:
+                        logger.exception("Could not restore prior deployment for %s", bot.bot_id)
+            elif backup_dir.exists():
+                try:
+                    shutil.rmtree(backup_dir)
+                except OSError:
+                    logger.warning("Could not remove prior deployment backup for %s", bot.bot_id)
+
+            if staging_dir.exists() or staging_dir.is_symlink():
+                try:
+                    if staging_dir.is_symlink():
+                        staging_dir.unlink()
+                    else:
+                        shutil.rmtree(staging_dir)
+                except OSError:
+                    logger.warning("Could not remove deployment staging directory for %s", bot.bot_id)
+            if build_home.exists() or build_home.is_symlink():
+                try:
+                    if build_home.is_symlink():
+                        build_home.unlink()
+                    else:
+                        shutil.rmtree(build_home)
+                except OSError:
+                    logger.warning("Could not remove temporary build home for %s", bot.bot_id)
+            async with self._lock:
+                self._deploying.discard(bot.bot_id)
+
+    async def refresh_checkout(self, bot: HostedBot) -> tuple[bool, str]:
+        if not self._safe_bot_id(bot.bot_id):
+            return False, "Invalid service identifier."
+        try:
+            repo_url = validate_github_repo_url(bot.github_url)
+            env_dict = _validate_deployment_env(bot.env_vars)
+        except ValueError as exc:
+            return False, str(exc)
+
+        stale_process: Optional[subprocess.Popen] = None
+        async with self._lock:
+            if bot.bot_id in self._deploying:
+                return False, "A deployment is already in progress for this service."
+            current_process = self.processes.get(bot.bot_id)
+            if current_process and current_process.poll() is None:
+                return False, "Stop the service before refreshing its checkout."
+            stale_process = current_process
+            self._deploying.add(bot.bot_id)
+
+        bot_dir = Config.REPOS_DIR / bot.bot_id
+        staging_dir = Config.REPOS_DIR / f".{bot.bot_id}.refresh-{uuid.uuid4().hex[:10]}"
+        build_home = Config.REPOS_DIR / f".{bot.bot_id}.refresh-home-{uuid.uuid4().hex[:10]}"
+        backup_dir = Config.REPOS_DIR / f".{bot.bot_id}.refresh-backup-{uuid.uuid4().hex[:10]}"
+        moved_old_repo = False
+        installed_new_repo = False
+        successful = False
+        try:
+            if stale_process is not None:
+                if not await self._terminate_process_group(stale_process.pid, stale_process):
+                    return False, "The previous process group could not be stopped safely."
+                await self._join_log_thread(bot.bot_id)
+                async with self._lock:
+                    if self.processes.get(bot.bot_id) is stale_process:
+                        self.processes.pop(bot.bot_id, None)
+            if bot.pid and self._verified_persisted_process(bot):
+                return False, "Stop the service before refreshing its checkout."
+            Config.REPOS_DIR.mkdir(parents=True, exist_ok=True)
+            build_env = _minimal_child_environment(build_home)
+            code, stdout, stderr = await _run_bounded_command(
+                ["git", "clone", "--depth", "1", "--no-tags", "--", repo_url, str(staging_dir)],
+                Config.REPOS_DIR,
+                build_env,
+                timeout=60,
+            )
+            if code != 0:
+                detail = (stderr or stdout).decode("utf-8", errors="replace")[-2000:]
+                return False, f"Git clone failed: {detail or 'git exited unsuccessfully.'}"
+
+            env_path = staging_dir / ".env"
+            if env_path.is_symlink():
+                env_path.unlink()
+            elif env_path.exists() and not env_path.is_file():
+                return False, "The repository contains an invalid .env path."
+            descriptor = os.open(
+                env_path,
+                os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0),
+                0o600,
+            )
+            with os.fdopen(descriptor, "w", encoding="utf-8") as env_file:
+                for key, value in env_dict.items():
+                    env_file.write(f"{key}={value}\n")
+            try:
+                env_path.chmod(0o600)
+            except OSError:
+                pass
+
+            if bot_dir.is_symlink():
+                bot_dir.unlink()
+            elif bot_dir.exists():
+                os.replace(bot_dir, backup_dir)
+                moved_old_repo = True
+            os.replace(staging_dir, bot_dir)
+            installed_new_repo = True
+            bot.github_url = repo_url
+            successful = True
+            return True, "Repository refreshed from GitHub. The service remains stopped."
+        except asyncio.TimeoutError:
+            return False, "Repository refresh timed out."
+        except Exception as exc:
+            logger.exception("Repository refresh failed for %s", bot.bot_id)
+            return False, f"Repository refresh failed: {str(exc)[:400]}"
+        finally:
+            if not successful:
+                if installed_new_repo and (bot_dir.exists() or bot_dir.is_symlink()):
+                    try:
+                        if bot_dir.is_symlink():
+                            bot_dir.unlink()
+                        else:
+                            shutil.rmtree(bot_dir)
+                    except OSError:
+                        logger.exception("Could not remove failed checkout for %s", bot.bot_id)
+                if moved_old_repo and backup_dir.exists():
+                    try:
+                        os.replace(backup_dir, bot_dir)
+                    except OSError:
+                        logger.exception("Could not restore checkout for %s", bot.bot_id)
+            elif backup_dir.exists():
+                try:
+                    shutil.rmtree(backup_dir)
+                except OSError:
+                    logger.warning("Could not remove prior checkout for %s", bot.bot_id)
+            for temporary in (staging_dir, build_home):
+                if temporary.exists() or temporary.is_symlink():
+                    try:
+                        if temporary.is_symlink() or not temporary.is_dir():
+                            temporary.unlink()
+                        else:
+                            shutil.rmtree(temporary)
+                    except OSError:
+                        logger.warning("Could not clean temporary path for %s", bot.bot_id)
+            async with self._lock:
+                self._deploying.discard(bot.bot_id)
 
     async def stop(self, bot_id: str) -> bool:
+        if not self._safe_bot_id(bot_id):
+            return False
         async with self._lock:
             process = self.processes.get(bot_id)
 
-        if not process:
+        if process is None:
             bot = db.get_bot(bot_id)
-            if bot and bot.pid:
+            if bot is None or not bot.pid:
+                return True
+            if not self._verified_persisted_process(bot):
                 try:
-                    os.kill(bot.pid, 15)
-                    await asyncio.sleep(2)
-                    os.kill(bot.pid, 9)
-                except (ProcessLookupError, OSError):
-                    pass
-            return True
+                    os.kill(bot.pid, 0)
+                except OSError:
+                    return True
+                logger.warning("Refusing to signal unverified PID %s for %s", bot.pid, bot_id)
+                return False
+            pid = bot.pid
+        else:
+            pid = process.pid
 
         try:
-            os.killpg(os.getpgid(process.pid), 15)
-            await asyncio.sleep(2)
-            if process.poll() is None:
-                os.killpg(os.getpgid(process.pid), 9)
-            return True
-        except Exception as e:
-            logger.error(f"Stop error for {bot_id}: {e}")
+            stopped = await self._terminate_process_group(pid, process)
+            if not stopped:
+                logger.error("Process group %s did not stop cleanly for %s", pid, bot_id)
+            return stopped
+        except Exception:
+            logger.exception("Stop error for %s", bot_id)
             return False
         finally:
             async with self._lock:
                 self.processes.pop(bot_id, None)
+            await self._join_log_thread(bot_id)
+
+    async def stop_all(self) -> None:
+        """Stop children at worker shutdown but retain desired running state for recovery."""
+        for bot in db.get_all_bots():
+            if bot.pid and bot.status == BotStatus.RUNNING.value:
+                await self.stop(bot.bot_id)
 
     async def restart(self, bot: HostedBot, password: str = "") -> tuple[bool, str]:
-        await self.stop(bot.bot_id)
-        await asyncio.sleep(1)
+        if not await self.stop(bot.bot_id):
+            return False, "The existing process could not be stopped safely; no replacement was started."
+        bot.pid = None
         return await self.deploy(bot, password)
 
     def is_alive(self, bot_id: str) -> bool:
@@ -529,13 +1103,7 @@ class ProcessManager:
         if process:
             return process.poll() is None
         bot = db.get_bot(bot_id)
-        if bot and bot.pid:
-            try:
-                os.kill(bot.pid, 0)
-                return True
-            except OSError:
-                return False
-        return False
+        return bool(bot and self._verified_persisted_process(bot))
 
 process_mgr = ProcessManager()
 
@@ -549,40 +1117,53 @@ class LogStreamer:
 
     async def tail(self, bot_id: str, lines: int = 50) -> str:
         bot = db.get_bot(bot_id)
-        if not bot or not bot.log_file:
+        if not bot or not bot.log_file or not re.fullmatch(r"bot_[A-Za-z0-9_-]{3,80}", bot_id):
             return "📭 No logs available."
 
-        log_path = Path(bot.log_file)
-        if not log_path.exists():
-            return "📭 Log file not found."
-
+        expected_path = (Config.LOGS_DIR / f"{bot_id}.log").resolve()
         try:
-            proc = await asyncio.create_subprocess_exec(
-                "tail", "-n", str(lines), str(log_path),
-                stdout=asyncio.subprocess.PIPE
-            )
-            stdout, _ = await proc.communicate()
-            return stdout.decode("utf-8", errors="replace")[-3800:]
-        except Exception as e:
-            return f"❌ Log read error: {e}"
+            log_path = Path(bot.log_file)
+            if log_path.is_symlink() or log_path.resolve() != expected_path:
+                return "❌ The stored log path is not safe to read."
+            if not log_path.is_file():
+                return "📭 Log file not found."
+            line_count = max(1, min(int(lines), 200))
+
+            def read_tail() -> str:
+                with log_path.open("rb") as handle:
+                    handle.seek(0, os.SEEK_END)
+                    size = handle.tell()
+                    start = max(0, size - 64 * 1024)
+                    handle.seek(start)
+                    data = handle.read(64 * 1024)
+                if start:
+                    data = data.split(b"\n", 1)[-1]
+                return b"\n".join(data.splitlines()[-line_count:]).decode("utf-8", errors="replace")[-3800:]
+
+            return await asyncio.to_thread(read_tail)
+        except Exception as exc:
+            logger.warning("Could not read logs for %s: %s", bot_id, exc)
+            return "❌ Log read error."
 
     def format_log_message(self, bot_id: str, content: str, live: bool = False) -> str:
         bot = db.get_bot(bot_id)
         status_emoji = "🟢" if bot and bot.status == "running" else "🔴"
-        mode_str = bot.mode.upper() if bot else "UNKNOWN"
-
-        header = (
-            f"{status_emoji} <b>📜 LIVE LOGS: {bot.name if bot else bot_id}</b>\n"
-            f"<i>Mode: <code>{mode_str}</code> | "
-            f"{'🔴 LIVE STREAM' if live else '📦 Snapshot'} | "
-            f"Lines: {Config.LOG_TAIL_LINES}</i>\n\n"
-        )
-
-        max_content = 3800
+        mode_str = escape(bot.mode.upper() if bot else "UNKNOWN", quote=False)
+        name = escape(bot.name if bot else bot_id, quote=False)
+        content = "".join(char for char in content if char in "\n\r\t" or ord(char) >= 32)
+        max_content = 3400
         if len(content) > max_content:
             content = "...[truncated]...\n" + content[-max_content:]
+        line_count = len(content.splitlines())
+        safe_content = escape(content, quote=False)
 
-        return header + f"<pre><code class='language-bash'>{content}</code></pre>"
+        header = (
+            f"{status_emoji} <b>📜 LIVE LOGS: {name}</b>\n"
+            f"<i>Mode: <code>{mode_str}</code> | "
+            f"{'🔴 LIVE STREAM' if live else '📦 Snapshot'} | "
+            f"Lines: {line_count}</i>\n\n"
+        )
+        return header + f"<pre><code class='language-bash'>{safe_content}</code></pre>"
 
 log_streamer = LogStreamer()
 
@@ -594,11 +1175,12 @@ class UI:
     @staticmethod
     def blockquote(text: str, expandable: bool = True) -> str:
         tag = "blockquote expandable" if expandable else "blockquote"
-        return f"<{tag}>{text}</{tag.split()[0]}>"
+        return f"<{tag}>{escape(text, quote=False)}</{tag.split()[0]}>"
 
     @staticmethod
     def code_block(text: str, lang: str = "bash") -> str:
-        return f"<pre><code class='language-{lang}'>{text}</code></pre>"
+        safe_lang = lang if re.fullmatch(r"[A-Za-z0-9_-]{1,32}", lang) else "text"
+        return f"<pre><code class='language-{safe_lang}'>{escape(text, quote=False)}</code></pre>"
 
     @staticmethod
     def main_menu(user_id: int) -> InlineKeyboardMarkup:
@@ -630,13 +1212,13 @@ class UI:
             cpu, mem = "N/A", "N/A"
 
         return (
-            f"{e} <b>{bot.name}</b> <code>[{bot.mode.upper()}]</code>\n"
-            f"├ ID: <code>{bot.bot_id}</code>\n"
-            f"├ Status: <b>{bot.status.upper()}</b>\n"
+            f"{e} <b>{escape(bot.name, quote=False)}</b> <code>[{escape(bot.mode.upper(), quote=False)}]</code>\n"
+            f"├ ID: <code>{escape(bot.bot_id, quote=False)}</code>\n"
+            f"├ Status: <b>{escape(bot.status.upper(), quote=False)}</b>\n"
             f"├ PID: <code>{bot.pid or 'None'}</code>\n"
             f"├ Restarts: <code>{bot.restart_count}</code>\n"
-            f"├ CPU: {cpu} | MEM: {mem}\n"
-            f"└ Created: <i>{bot.created_at[:19]}</i>\n"
+            f"├ CPU: {escape(str(cpu), quote=False)} | MEM: {escape(str(mem), quote=False)}\n"
+            f"└ Created: <i>{escape(str(bot.created_at[:19]), quote=False)}</i>\n"
         )
 
     @staticmethod
@@ -707,6 +1289,108 @@ class UI:
 
 ui = UI()
 
+
+def redact_sensitive_log_text(text: str) -> str:
+    sensitive_markers = (
+        "token", "secret", "password", "passwd", "credential", "api_key",
+        "access_key", "private_key", "authorization", "cookie", "database_url",
+        "db_url", "mongo_uri", "redis_url", "dsn",
+    )
+    redacted_lines = []
+    for original_line in text.splitlines():
+        line = original_line
+        matched_secret = False
+        for separator in ("=", ":"):
+            pieces = line.split(separator)
+            for index in range(len(pieces) - 1):
+                key = separator.join(pieces[:index + 1]).strip().lower().replace("-", "_").replace(" ", "_")
+                if any(marker in key for marker in sensitive_markers):
+                    line = separator.join(pieces[:index + 1]) + separator + "[REDACTED]"
+                    matched_secret = True
+                    break
+            if matched_secret:
+                break
+
+        lowered = line.lower()
+        search_from = 0
+        while True:
+            bearer_index = lowered.find("bearer ", search_from)
+            if bearer_index < 0:
+                break
+            value_start = bearer_index + len("bearer ")
+            value_end = value_start
+            while value_end < len(line) and not line[value_end].isspace() and line[value_end] not in ",;":
+                value_end += 1
+            line = line[:value_start] + "[REDACTED]" + line[value_end:]
+            lowered = line.lower()
+            search_from = value_start + len("[REDACTED]")
+
+        for part in line.split():
+            candidate = part.strip(".,;()[]{}<>\"'")
+            if ":" not in candidate:
+                continue
+            prefix, suffix = candidate.split(":", 1)
+            if prefix.isdigit() and 6 <= len(prefix) <= 12 and len(suffix) >= 20 and all(char.isalnum() or char in "-_" for char in suffix):
+                line = line.replace(candidate, "[REDACTED_TELEGRAM_TOKEN]")
+        redacted_lines.append("".join(char for char in line if ord(char) >= 32 or char in (chr(9), chr(10), chr(13))))
+    return chr(10).join(redacted_lines)
+
+
+async def notify_admins_about_bot_failure(
+    context: ContextTypes.DEFAULT_TYPE,
+    bot: HostedBot,
+    title: str,
+    reason: str,
+) -> None:
+    if not Config.ADMIN_IDS:
+        logger.error("%s for %s; no ADMIN_IDS are configured", title, bot.bot_id)
+        return
+
+    try:
+        logs = await log_streamer.tail(bot.bot_id, 50)
+    except Exception:
+        logger.exception("Could not collect failure logs for %s", bot.bot_id)
+        logs = "Log collection failed. Check the worker volume manually."
+    logs = redact_sensitive_log_text(logs)
+    reason = "".join(char for char in reason[:400] if ord(char) >= 32 or char in (chr(9), chr(10), chr(13)))
+    newline = chr(10)
+
+    def build_message(log_text: str, reason_text: str) -> str:
+        return (
+            f"🚨 <b>{escape(title, quote=False)}</b>{newline}{newline}"
+            f"Service: <b>{escape(bot.name, quote=False)}</b>{newline}"
+            f"ID: <code>{escape(bot.bot_id, quote=False)}</code> · Owner: <code>{bot.owner_id}</code>{newline}"
+            f"Reason: <code>{escape(reason_text, quote=False)}</code>{newline}{newline}"
+            f"<b>Recent logs</b>{newline}{ui.code_block(log_text, 'text')}"
+        )
+
+    message = build_message(logs, reason)
+    if len(message) > 3800:
+        low, high = 0, len(logs)
+        while low < high:
+            middle = (low + high + 1) // 2
+            candidate = build_message(logs[-middle:] if middle else "", reason)
+            if len(candidate) <= 3800:
+                low = middle
+            else:
+                high = middle - 1
+        clipped_logs = logs[-low:] if low else ""
+        if low < len(logs):
+            clipped_logs = "...[truncated]..." + newline + clipped_logs if clipped_logs else "...[truncated]..."
+        message = build_message(clipped_logs, reason)
+
+    for admin_id in Config.ADMIN_IDS:
+        try:
+            await context.bot.send_message(
+                chat_id=admin_id,
+                text=message,
+                parse_mode="HTML",
+                disable_web_page_preview=True,
+            )
+        except Exception:
+            logger.warning("Could not DM admin %s about %s", admin_id, bot.bot_id, exc_info=True)
+
+
 # ═══════════════════════════════════════════════════════════════════
 # CONVERSATION STATES
 # ═══════════════════════════════════════════════════════════════════
@@ -727,7 +1411,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     welcome = (
         f"<b>🤖 ULTIMATE HOSTING BOT v3.1</b>\n\n"
         f"Welcome, {user.mention_html()}!\n\n"
-        f"{ui.blockquote('Deploy and manage Telegram bot workers from GitHub with process isolation, crash-loop protection, and endpoint health monitoring.')}\n\n"
+        f"{ui.blockquote('Deploy and manage trusted GitHub bot workers with process-group controls, crash-loop protection, and endpoint health monitoring.')}\n\n"
         f"<b>🚀 Quick Start:</b>\n"
         f"1. Click <b>DEPLOY NEW BOT</b>\n"
         f"2. Paste your GitHub URL\n"
@@ -759,10 +1443,14 @@ async def cmd_logs(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     bot_id = args[0]
-    lines = int(args[1]) if len(args) > 1 and args[1].isdigit() else Config.LOG_TAIL_LINES
+    try:
+        lines = int(args[1]) if len(args) > 1 and args[1].isdigit() else Config.LOG_TAIL_LINES
+    except ValueError:
+        lines = Config.LOG_TAIL_LINES
+    lines = max(1, min(lines, 200))
 
     bot = db.get_bot(bot_id)
-    if not bot or (bot.owner_id != user_id and user_id not in Config.ADMIN_IDS):
+    if not can_manage_bot(bot, user_id):
         await update.message.reply_text("❌ Bot not found or access denied.")
         return
 
@@ -874,7 +1562,7 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif data.startswith("act_start_"):
         bot_id = data.split("_", 2)[2]
-        await handle_start(query, bot_id, user_id)
+        await handle_start(query, bot_id, user_id, context)
 
     elif data.startswith("act_stop_"):
         bot_id = data.split("_", 2)[2]
@@ -882,7 +1570,7 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif data.startswith("act_restart_"):
         bot_id = data.split("_", 2)[2]
-        await handle_restart(query, bot_id, user_id)
+        await handle_restart(query, bot_id, user_id, context)
 
     elif data.startswith("act_logs_"):
         bot_id = data.split("_", 2)[2]
@@ -899,8 +1587,8 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data.startswith("act_mode_"):
         bot_id = data.split("_", 2)[2]
         bot = db.get_bot(bot_id)
-        if not bot:
-            await query.answer("Bot not found!", show_alert=True)
+        if not can_manage_bot(bot, user_id):
+            await query.answer("Service not found or access denied.", show_alert=True)
             return
         mode_help = ui.blockquote("Production = Auto-heal + Optimized\nDevelopment = Verbose + No auto-restart\nMaintenance = Offline mode")
         await query.edit_message_text(
@@ -913,33 +1601,43 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif data.startswith("act_env_"):
         bot_id = data.split("_", 2)[2]
-        context.user_data["env_bot_id"] = bot_id
         bot = db.get_bot(bot_id)
-        current_env = json.loads(bot.env_vars) if bot.env_vars else {}
-        env_text = "\n".join([f"{k}={v}" for k, v in current_env.items()]) or "None set"
+        if not can_manage_bot(bot, user_id):
+            await query.answer("Service not found or access denied.", show_alert=True)
+            return
+        context.user_data["env_bot_id"] = bot_id
+        try:
+            current_env = json.loads(bot.env_vars) if bot.env_vars else {}
+        except (TypeError, json.JSONDecodeError):
+            current_env = {}
+        if not isinstance(current_env, dict):
+            current_env = {}
+        env_text = "\n".join([f"{k}=••••••" for k in current_env]) or "None set"
 
         await query.edit_message_text(
             f"<b>🔧 Edit Environment Variables</b>\n\n"
-            f"Bot: <code>{bot.name}</code>\n\n"
-            f"Current:\n{ui.code_block(env_text, 'env')}\n\n"
-            f"Send new vars in format:\n<code>KEY=value\nKEY2=value2</code>\n\nOr send 'clear' to remove all.\n/cancel to abort.",
+            f"Bot: <code>{escape(bot.name, quote=False)}</code>\n\n"
+            f"Current keys (values hidden):\n{ui.code_block(env_text, 'env')}\n\n"
+            f"Send the complete replacement as:\n<code>KEY=value\nKEY2=value2</code>\n"
+            f"Secret values are hidden; re-enter any secrets you want to keep.\n\n"
+            f"Or send 'clear' to remove all.\n/cancel to abort.",
             parse_mode="HTML"
         )
         return ST_ENV_EDIT
 
     elif data.startswith("act_pull_"):
         bot_id = data.split("_", 2)[2]
-        await handle_git_pull(query, bot_id, user_id)
+        await handle_git_pull(query, bot_id, user_id, context)
 
     elif data.startswith("act_backup_"):
         bot_id = data.split("_", 2)[2]
-        await handle_backup(query, bot_id, user_id)
+        await handle_backup(query, bot_id, user_id, context)
 
     elif data.startswith("act_delete_"):
         bot_id = data.split("_", 2)[2]
         bot = db.get_bot(bot_id)
-        if not bot:
-            await query.answer("Not found!", show_alert=True)
+        if not can_manage_bot(bot, user_id):
+            await query.answer("Service not found or access denied.", show_alert=True)
             return
         await query.edit_message_text(
             f"⚠️ <b>Delete {bot.name}?</b>\n\n"
@@ -1007,15 +1705,15 @@ async def show_bot_list(query, user_id: int):
 
 async def show_bot_manage(query, bot_id: str, user_id: int):
     bot = db.get_bot(bot_id)
-    if not bot or (bot.owner_id != user_id and user_id not in Config.ADMIN_IDS):
+    if not can_manage_bot(bot, user_id):
         await query.answer("⛔ Access denied!", show_alert=True)
         return
 
     text = (
-        f"<b>🔧 MANAGE: {bot.name}</b>\n\n"
+        f"<b>🔧 MANAGE: {escape(bot.name, quote=False)}</b>\n\n"
         f"{ui.bot_card(bot)}\n"
-        f"GitHub: <a href='{bot.github_url}'>Open Repo</a>\n"
-        f"Last Error: <code>{bot.last_error or 'None'}</code>\n\n"
+        f"GitHub: <a href='{escape(bot.github_url, quote=True)}'>Open Repo</a>\n"
+        f"Last Error: <code>{escape(bot.last_error or 'None', quote=False)}</code>\n\n"
         f"{ui.blockquote('Select an action below:')}"
     )
 
@@ -1024,9 +1722,9 @@ async def show_bot_manage(query, bot_id: str, user_id: int):
         reply_markup=ui.bot_actions(bot_id, bot.status)
     )
 
-async def handle_start(query, bot_id: str, user_id: int):
+async def handle_start(query, bot_id: str, user_id: int, context: ContextTypes.DEFAULT_TYPE):
     bot = db.get_bot(bot_id)
-    if not bot or bot.owner_id != user_id:
+    if not can_manage_bot(bot, user_id):
         await query.answer("Denied!", show_alert=True)
         return
 
@@ -1034,8 +1732,13 @@ async def handle_start(query, bot_id: str, user_id: int):
 
     success, msg = await process_mgr.deploy(bot, "")
     if success:
-        db.update_bot(bot_id, status=BotStatus.RUNNING.value, pid=bot.pid, 
-                     log_file=bot.log_file, updated_at=datetime.now().isoformat())
+        db.update_bot(
+            bot_id,
+            status=BotStatus.RUNNING.value,
+            pid=bot.pid,
+            log_file=bot.log_file,
+            last_error=None,
+        )
         await query.edit_message_text(
             f"✅ <b>{bot.name} is LIVE!</b>\n\n{ui.code_block(msg)}",
             parse_mode="HTML",
@@ -1044,9 +1747,17 @@ async def handle_start(query, bot_id: str, user_id: int):
             ]])
         )
     else:
-        db.update_bot(bot_id, status=BotStatus.ERROR.value, last_error=msg[:200])
+        still_running = process_mgr.is_alive(bot_id)
+        db.update_bot(
+            bot_id,
+            status=BotStatus.RUNNING.value if still_running else BotStatus.ERROR.value,
+            pid=bot.pid if still_running else None,
+            last_error=msg[:200],
+        )
+        if not still_running:
+            await notify_admins_about_bot_failure(context, bot, "Hosted bot failed to start", msg)
         await query.edit_message_text(
-            f"❌ <b>Failed to start {bot.name}</b>\n\n{ui.code_block(msg)}",
+            f"❌ <b>Failed to start {escape(bot.name, quote=False)}</b>\n\n{ui.code_block(msg)}",
             parse_mode="HTML",
             reply_markup=InlineKeyboardMarkup([[
                 InlineKeyboardButton("🔙 Back", callback_data=f"nav_manage_{bot_id}")
@@ -1055,7 +1766,7 @@ async def handle_start(query, bot_id: str, user_id: int):
 
 async def handle_stop(query, bot_id: str, user_id: int):
     bot = db.get_bot(bot_id)
-    if not bot or bot.owner_id != user_id:
+    if not can_manage_bot(bot, user_id):
         return
 
     await query.edit_message_text(f"🟡 <b>Stopping {bot.name}...</b>", parse_mode="HTML")
@@ -1073,9 +1784,9 @@ async def handle_stop(query, bot_id: str, user_id: int):
     else:
         await query.answer("Failed to stop!", show_alert=True)
 
-async def handle_restart(query, bot_id: str, user_id: int):
+async def handle_restart(query, bot_id: str, user_id: int, context: ContextTypes.DEFAULT_TYPE):
     bot = db.get_bot(bot_id)
-    if not bot or bot.owner_id != user_id:
+    if not can_manage_bot(bot, user_id):
         return
 
     await query.edit_message_text(f"🔄 <b>Restarting {bot.name}...</b>", parse_mode="HTML")
@@ -1083,17 +1794,31 @@ async def handle_restart(query, bot_id: str, user_id: int):
 
     success, msg = await process_mgr.restart(bot)
     if success:
-        db.update_bot(bot_id, status=BotStatus.RUNNING.value, pid=bot.pid,
-                     restart_count=bot.restart_count + 1)
+        db.update_bot(
+            bot_id,
+            status=BotStatus.RUNNING.value,
+            pid=bot.pid,
+            log_file=bot.log_file,
+            restart_count=bot.restart_count + 1,
+            last_error=None,
+        )
         await query.edit_message_text(
-            f"✅ <b>{bot.name} restarted!</b>\n\n{ui.code_block(msg)}",
+            f"✅ <b>{escape(bot.name, quote=False)} restarted!</b>\n\n{ui.code_block(msg)}",
             parse_mode="HTML",
             reply_markup=InlineKeyboardMarkup([[
                 InlineKeyboardButton("🔧 Manage", callback_data=f"nav_manage_{bot_id}")
             ]])
         )
     else:
-        db.update_bot(bot_id, status=BotStatus.ERROR.value, last_error=msg[:200])
+        still_running = process_mgr.is_alive(bot_id)
+        db.update_bot(
+            bot_id,
+            status=BotStatus.RUNNING.value if still_running else BotStatus.ERROR.value,
+            pid=bot.pid if still_running else None,
+            last_error=msg[:200],
+        )
+        if not still_running:
+            await notify_admins_about_bot_failure(context, bot, "Hosted bot restart failed", msg)
         await query.edit_message_text(
             f"❌ <b>Restart failed</b>\n\n{ui.code_block(msg)}",
             parse_mode="HTML",
@@ -1104,7 +1829,7 @@ async def handle_restart(query, bot_id: str, user_id: int):
 
 async def handle_logs(query, bot_id: str, user_id: int):
     bot = db.get_bot(bot_id)
-    if not bot or (bot.owner_id != user_id and user_id not in Config.ADMIN_IDS):
+    if not can_manage_bot(bot, user_id):
         await query.answer("Denied!", show_alert=True)
         return
 
@@ -1119,7 +1844,7 @@ async def handle_logs(query, bot_id: str, user_id: int):
 
 async def handle_live_logs(query, bot_id: str, user_id: int, context: ContextTypes.DEFAULT_TYPE):
     bot = db.get_bot(bot_id)
-    if not bot or bot.owner_id != user_id:
+    if not can_manage_bot(bot, user_id):
         return
 
     logs = await log_streamer.tail(bot_id, 20)
@@ -1141,7 +1866,7 @@ async def live_log_stream(context: ContextTypes.DEFAULT_TYPE, bot_id: str,
         while True:
             await asyncio.sleep(5)
             bot = db.get_bot(bot_id)
-            if not bot or bot.owner_id != user_id:
+            if not can_manage_bot(bot, user_id):
                 break
 
             logs = await log_streamer.tail(bot_id, 25)
@@ -1160,119 +1885,312 @@ async def live_log_stream(context: ContextTypes.DEFAULT_TYPE, bot_id: str,
 
 async def handle_log_download(query, bot_id: str, user_id: int, context: ContextTypes.DEFAULT_TYPE):
     bot = db.get_bot(bot_id)
-    if not bot or not bot.log_file or not Path(bot.log_file).exists():
+    if not can_manage_bot(bot, user_id):
+        await query.answer("Service not found or access denied.", show_alert=True)
+        return
+    if not bot.log_file or not re.fullmatch(r"bot_[A-Za-z0-9_-]{3,80}", bot_id):
         await query.answer("No log file!", show_alert=True)
+        return
+    expected_log = (Config.LOGS_DIR / f"{bot_id}.log").resolve()
+    log_path = Path(bot.log_file)
+    try:
+        if log_path.is_symlink() or log_path.resolve() != expected_log or not log_path.is_file():
+            await query.answer("The log file is unavailable or unsafe.", show_alert=True)
+            return
+        if log_path.stat().st_size > 20 * 1024 * 1024:
+            await query.answer("The log file exceeds the 20 MB Telegram upload limit.", show_alert=True)
+            return
+    except OSError:
+        await query.answer("The log file is unavailable.", show_alert=True)
         return
 
     await query.answer("Sending file...")
     await context.bot.send_document(
         chat_id=user_id,
-        document=InputFile(bot.log_file),
+        document=InputFile(str(log_path)),
         filename=f"{bot_id}_logs.txt",
-        caption=f"📥 Full logs for <b>{bot.name}</b>",
+        caption=f"📥 Full logs for <b>{escape(bot.name, quote=False)}</b>",
         parse_mode="HTML"
     )
 
 async def set_mode(query, bot_id: str, mode: str, user_id: int):
     bot = db.get_bot(bot_id)
-    if not bot or bot.owner_id != user_id:
+    if not can_manage_bot(bot, user_id):
         return
-
-    db.update_bot(bot_id, mode=mode)
 
     if mode == "maintenance":
-        await process_mgr.stop(bot_id)
-        db.update_bot(bot_id, status=BotStatus.MAINTENANCE.value, pid=None)
+        if not await process_mgr.stop(bot_id):
+            await query.answer("Could not stop the process safely.", show_alert=True)
+            return
+        db.update_bot(bot_id, mode=mode, status=BotStatus.MAINTENANCE.value, pid=None)
+    else:
+        db.update_bot(bot_id, mode=mode)
 
     await query.answer(f"Mode set to {mode.upper()}!")
-    query.data = f"nav_manage_{bot_id}"
-    await callback_router(query, None)
+    await show_bot_manage(query, bot_id, user_id)
 
-async def handle_git_pull(query, bot_id: str, user_id: int):
+async def handle_git_pull(query, bot_id: str, user_id: int, context: ContextTypes.DEFAULT_TYPE):
     bot = db.get_bot(bot_id)
-    if not bot or bot.owner_id != user_id:
+    if not can_manage_bot(bot, user_id):
+        await query.answer("Service not found or access denied.", show_alert=True)
+        return
+    try:
+        bot.github_url = validate_github_repo_url(bot.github_url)
+    except ValueError:
+        await query.answer("Stored repository URL is invalid; refusing to update it.", show_alert=True)
         return
 
     bot_dir = Config.REPOS_DIR / bot_id
-    if not bot_dir.exists():
-        await query.answer("Repo not found!", show_alert=True)
+    if bot_dir.is_symlink() or not bot_dir.is_dir():
+        await query.answer("Repository checkout not found or unsafe.", show_alert=True)
         return
 
-    await query.edit_message_text(f"🔄 <b>Pulling updates for {bot.name}...</b>", parse_mode="HTML")
+    await query.edit_message_text(f"🔄 <b>Updating {escape(bot.name, quote=False)}...</b>", parse_mode="HTML")
+    db.update_bot(bot_id, github_url=bot.github_url)
+    was_running = bot.status == BotStatus.RUNNING.value or process_mgr.is_alive(bot_id)
 
+    if was_running:
+        success, output = await process_mgr.restart(bot)
+        if success:
+            db.update_bot(
+                bot_id,
+                status=BotStatus.RUNNING.value,
+                pid=bot.pid,
+                log_file=bot.log_file,
+                restart_count=bot.restart_count + 1,
+                last_error=None,
+            )
+            result = f"✅ Update and redeploy complete.\n{output}"
+        else:
+            still_running = process_mgr.is_alive(bot_id)
+            db.update_bot(
+                bot_id,
+                status=BotStatus.RUNNING.value if still_running else BotStatus.ERROR.value,
+                pid=bot.pid if still_running else None,
+                last_error=output[:200],
+            )
+            if not still_running:
+                await notify_admins_about_bot_failure(context, bot, "Hosted bot update failed", output)
+            result = f"❌ Update failed.\n{output}"
+    else:
+        success, output = await process_mgr.refresh_checkout(bot)
+        if success:
+            db.update_bot(bot_id, github_url=bot.github_url, last_error=None)
+            result = f"✅ Repository updated. The service remains stopped.\n{output}"
+        else:
+            db.update_bot(bot_id, last_error=output[:200])
+            await notify_admins_about_bot_failure(context, bot, "Hosted bot checkout update failed", output)
+            result = f"❌ Update failed.\n{output}"
+
+    await query.edit_message_text(
+        ui.code_block(result),
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("🔙 Back", callback_data=f"nav_manage_{bot_id}")
+        ]]),
+    )
+
+def _prune_bot_backups(bot_id: str) -> None:
+    candidates = []
+    for path in Config.BACKUPS_DIR.glob(f"{bot_id}_*.zip"):
+        try:
+            if path.is_symlink():
+                path.unlink()
+            elif path.is_file():
+                candidates.append((path.stat().st_mtime_ns, path.name, path))
+        except OSError:
+            logger.warning("Could not inspect old backup %s", path, exc_info=True)
+
+    keep_count = max(1, MAX_BACKUPS_PER_BOT)
+    candidates.sort()
+    for _, _, path in candidates[:-keep_count]:
+        try:
+            path.unlink()
+        except OSError:
+            logger.warning("Could not prune old backup %s", path, exc_info=True)
+
+
+def create_bot_backup(bot_id: str, bot_dir: Path) -> Path:
+    if not re.fullmatch(r"bot_[A-Za-z0-9_-]{3,80}", bot_id):
+        raise ValueError("Invalid service ID")
+    expected_dir = Config.REPOS_DIR / bot_id
+    if bot_dir != expected_dir or bot_dir.is_symlink() or not bot_dir.is_dir():
+        raise FileNotFoundError("Hosted repository is missing or unsafe")
+
+    root = bot_dir.resolve(strict=True)
+    expected_root = expected_dir.resolve(strict=True)
+    if root != expected_root:
+        raise ValueError("Hosted repository path does not match the service ID")
+
+    backup_root = Config.BACKUPS_DIR
+    backup_root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    if backup_root.is_symlink():
+        raise ValueError("Backup directory must not be a symbolic link")
+    backup_root.chmod(0o700)
+
+    excluded_directories = {".git", "node_modules", ".venv", "venv", "__pycache__"}
+    files = []
+    planned_size = 0
+
+    def raise_walk_error(error: OSError) -> None:
+        raise error
+
+    for current, directories, names in os.walk(root, topdown=True, followlinks=False, onerror=raise_walk_error):
+        current_path = Path(current)
+        resolved_current = current_path.resolve(strict=True)
+        if not resolved_current.is_relative_to(root):
+            raise ValueError("Repository traversal escaped its root")
+
+        directories[:] = [
+            name for name in directories
+            if name not in excluded_directories and not (current_path / name).is_symlink()
+        ]
+        for name in names:
+            file_path = current_path / name
+            if file_path.is_symlink():
+                continue
+            resolved_file = file_path.resolve(strict=True)
+            if not resolved_file.is_relative_to(root):
+                raise ValueError("Repository file resolves outside its root")
+            file_info = os.stat(resolved_file, follow_symlinks=False)
+            if not stat.S_ISREG(file_info.st_mode):
+                continue
+            if file_info.st_nlink > 1:
+                raise ValueError("Backup refuses hard-linked files for safety")
+            planned_size += file_info.st_size
+            if planned_size > MAX_BACKUP_INPUT_BYTES:
+                raise ValueError(f"Backup exceeds the {MAX_BACKUP_INPUT_BYTES // (1024 * 1024)} MiB uncompressed size limit")
+            if len(files) >= MAX_BACKUP_FILES:
+                raise ValueError(f"Backup contains more than {MAX_BACKUP_FILES} files")
+            files.append((resolved_file, file_path.relative_to(root).as_posix(), file_info))
+
+    timestamp = time.time_ns()
+    backup_path = backup_root / f"{bot_id}_{timestamp}_{uuid.uuid4().hex[:8]}.zip"
+    temporary_path = backup_root / f".{backup_path.name}.tmp"
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(temporary_path, flags, 0o600)
+    total_bytes = 0
     try:
-        proc = await asyncio.create_subprocess_exec(
-            "git", "-C", str(bot_dir), "pull",
-            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
-        )
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=60)
-        output = stdout.decode() or stderr.decode()
+        with os.fdopen(descriptor, "wb") as output:
+            with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as archive:
+                for file_path, arcname, scanned_info in files:
+                    file_descriptor = os.open(file_path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+                    with os.fdopen(file_descriptor, "rb") as source:
+                        opened_info = os.fstat(source.fileno())
+                        if not stat.S_ISREG(opened_info.st_mode) or (opened_info.st_dev, opened_info.st_ino) != (scanned_info.st_dev, scanned_info.st_ino):
+                            raise ValueError("Repository changed while the backup was being created")
+                        zip_info = zipfile.ZipInfo(arcname)
+                        zip_info.compress_type = zipfile.ZIP_DEFLATED
+                        zip_info.external_attr = (stat.S_IMODE(opened_info.st_mode) & 0xFFFF) << 16
+                        with archive.open(zip_info, "w") as destination:
+                            while True:
+                                chunk = source.read(64 * 1024)
+                                if not chunk:
+                                    break
+                                total_bytes += len(chunk)
+                                if total_bytes > MAX_BACKUP_INPUT_BYTES:
+                                    raise ValueError(f"Backup exceeds the {MAX_BACKUP_INPUT_BYTES // (1024 * 1024)} MiB uncompressed size limit")
+                                destination.write(chunk)
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(temporary_path, backup_path)
+        try:
+            backup_path.chmod(0o600)
+        except OSError:
+            logger.warning("Could not set private permissions on backup %s", backup_path, exc_info=True)
+    except Exception:
+        try:
+            temporary_path.unlink(missing_ok=True)
+        except OSError:
+            logger.warning("Could not remove incomplete backup %s", temporary_path, exc_info=True)
+        raise
 
-        was_running = bot.status == "running"
-        if was_running:
-            await process_mgr.restart(bot)
+    _prune_bot_backups(bot_id)
+    return backup_path
 
-        await query.edit_message_text(
-            f"✅ <b>Git Pull Complete: {bot.name}</b>\n\n"
-            f"{ui.code_block(output[:1500], 'bash')}\n\n"
-            f"{'🔄 Auto-restarted.' if was_running else '⏹ Was stopped, not restarted.'}",
-            parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("🔙 Back", callback_data=f"nav_manage_{bot_id}")
-            ]])
-        )
-    except Exception as e:
-        await query.edit_message_text(
-            f"❌ <b>Git Pull Failed</b>\n\n{ui.code_block(str(e))}",
-            parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("🔙 Back", callback_data=f"nav_manage_{bot_id}")
-            ]])
-        )
 
-async def handle_backup(query, bot_id: str, user_id: int):
+async def handle_backup(query, bot_id: str, user_id: int, context: ContextTypes.DEFAULT_TYPE):
     bot = db.get_bot(bot_id)
-    if not bot or bot.owner_id != user_id:
+    if not can_manage_bot(bot, user_id):
+        await query.answer("Service not found or access denied.", show_alert=True)
         return
 
     bot_dir = Config.REPOS_DIR / bot_id
-    backup_path = Config.BACKUPS_DIR / f"{bot_id}_{int(time.time())}.zip"
-    Config.BACKUPS_DIR.mkdir(exist_ok=True)
-
     try:
-        shutil.make_archive(str(backup_path).replace(".zip", ""), 'zip', bot_dir)
-        await query.answer("Backup created!")
-        await query.edit_message_text(
-            f"✅ <b>Backup Created: {bot.name}</b>\n\n"
-            f"Size: <code>{backup_path.stat().st_size / 1024:.1f} KB</code>\n"
-            f"Path: <code>{backup_path.name}</code>",
-            parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("🔙 Back", callback_data=f"nav_manage_{bot_id}")
-            ]])
-        )
-    except Exception as e:
-        await query.answer("Backup failed!", show_alert=True)
+        backup_path = await asyncio.to_thread(create_bot_backup, bot_id, bot_dir)
+    except ValueError as exc:
+        await query.answer(str(exc), show_alert=True)
+        return
+    except Exception:
+        logger.exception("Backup creation failed for %s", bot_id)
+        await query.answer("Backup failed. Check the worker logs for details.", show_alert=True)
+        return
+
+    archive_size = backup_path.stat().st_size
+    delivery = "Retained in the worker volume; it exceeds Telegram's 20 MiB upload limit."
+    await query.answer("Backup created!")
+    if archive_size <= MAX_BACKUP_TELEGRAM_BYTES:
+        try:
+            await context.bot.send_document(
+                chat_id=user_id,
+                document=InputFile(str(backup_path)),
+                filename=f"{bot_id}_backup.zip",
+                caption=f"📦 Backup for <b>{escape(bot.name, quote=False)}</b>",
+                parse_mode="HTML",
+            )
+            delivery = "The ZIP archive was sent to your Telegram DM."
+        except Exception:
+            logger.warning("Could not deliver backup %s to user %s", backup_path.name, user_id, exc_info=True)
+            delivery = "Saved in the worker volume, but Telegram delivery failed."
+
+    await query.edit_message_text(
+        f"✅ <b>Backup Created: {escape(bot.name, quote=False)}</b>\n\n"
+        f"Size: <code>{archive_size / 1024:.1f} KB</code>\n"
+        f"Archive: <code>{escape(backup_path.name, quote=False)}</code>\n"
+        f"{escape(delivery, quote=False)}",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("🔙 Back", callback_data=f"nav_manage_{bot_id}")
+        ]])
+    )
+
 
 async def handle_delete(query, bot_id: str, user_id: int):
     bot = db.get_bot(bot_id)
-    if not bot or bot.owner_id != user_id:
+    if not can_manage_bot(bot, user_id):
         return
 
-    await process_mgr.stop(bot_id)
-    bot_dir = Config.REPOS_DIR / bot_id
-    if bot_dir.exists():
-        shutil.rmtree(bot_dir)
+    if not await process_mgr.stop(bot_id):
+        await query.answer("The process could not be stopped safely; nothing was deleted.", show_alert=True)
+        return
 
-    log_file = Config.LOGS_DIR / f"{bot_id}.log"
-    if log_file.exists():
-        log_file.unlink()
+    repo_dir = Config.REPOS_DIR / bot_id
+    bot_home = Config.BASE_DIR / "bot_homes" / bot_id
+    base_log = Config.LOGS_DIR / f"{bot_id}.log"
+    log_files = [base_log, *[Path(f"{base_log}.{index}") for index in range(1, PROCESS_LOG_BACKUPS + 1)]]
+    backups = list(Config.BACKUPS_DIR.glob(f"{bot_id}_*.zip"))
+    try:
+        for directory in (repo_dir, bot_home):
+            if directory.is_symlink():
+                directory.unlink()
+            elif directory.exists():
+                shutil.rmtree(directory)
+        for file_path in [*log_files, *backups]:
+            if file_path.is_symlink() or file_path.is_file():
+                file_path.unlink()
+            elif file_path.is_dir():
+                shutil.rmtree(file_path)
+    except OSError as exc:
+        logger.exception("Could not fully remove service data for %s", bot_id)
+        await query.answer(f"Could not remove all service data: {str(exc)[:120]}", show_alert=True)
+        return
 
+    process_mgr.auto_heal_attempts.pop(bot_id, None)
     db.delete_bot(bot_id)
     db._audit(bot_id, user_id, "DELETE", f"Deleted bot {bot.name}")
 
     await query.edit_message_text(
-        f"🗑 <b>{bot.name} deleted permanently.</b>",
+        f"🗑 <b>{escape(bot.name, quote=False)} deleted permanently.</b>",
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup([[
             InlineKeyboardButton("📋 My Bots", callback_data="nav_list")
@@ -1323,8 +2241,11 @@ async def handle_cleanup(query, user_id: int):
             count += 1
 
     await query.answer(f"Cleaned {count} old logs!")
-    query.data = "nav_admin"
-    await callback_router(query, None)
+    await query.edit_message_text(
+        f"🧹 <b>Cleanup complete</b>\n\nRemoved <code>{count}</code> expired log file(s).",
+        parse_mode="HTML",
+        reply_markup=ui.admin_panel(),
+    )
 
 async def handle_restart_all(query, user_id: int):
     if user_id not in Config.ADMIN_IDS:
@@ -1377,11 +2298,12 @@ async def show_sysinfo(query):
 # ═══════════════════════════════════════════════════════════════════
 
 async def deploy_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    url = update.message.text.strip()
-    user_id = update.effective_user.id
+    raw_url = update.message.text.strip()
 
-    if not url.startswith(("https://github.com/", "http://github.com/")):
-        await update.message.reply_text("❌ Invalid GitHub URL. Try again or /cancel:")
+    try:
+        url = validate_github_repo_url(raw_url)
+    except ValueError:
+        await update.message.reply_text("❌ Use a public HTTPS GitHub URL like https://github.com/owner/repository. Try again or /cancel:")
         return ST_DEPLOY_URL
 
     context.user_data["deploy_url"] = url
@@ -1408,12 +2330,16 @@ async def deploy_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_html(
         "<b>🔐 Security</b>\n\n"
         "Step 3/4: Send <b>password/secret</b> for your bot's .env\n"
+        "Only continue in a private chat. Secrets are stored on the worker and values are hidden when editing.\n"
         "Or send <code>skip</code> if not needed:"
     )
     return ST_DEPLOY_PASS
 
 async def deploy_password(update: Update, context: ContextTypes.DEFAULT_TYPE):
     pwd = update.message.text.strip()
+    if pwd.lower() != "skip" and (len(pwd.encode("utf-8")) > 8192 or any(char in pwd for char in ("\x00", "\n", "\r"))):
+        await update.message.reply_text("Secret must be a single-line value no longer than 8 KB. Try again or send skip.")
+        return ST_DEPLOY_PASS
     context.user_data["deploy_password"] = "" if pwd.lower() == "skip" else pwd
 
     await update.message.reply_html(
@@ -1433,6 +2359,12 @@ async def deploy_env(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if '=' in line:
                 k, v = line.split('=', 1)
                 env_vars[k.strip()] = v.strip()
+
+    try:
+        _validate_deployment_env(json.dumps(env_vars))
+    except ValueError as exc:
+        await update.message.reply_text(f"Invalid environment variables: {exc}")
+        return ST_DEPLOY_ENV
 
     context.user_data["deploy_env"] = env_vars
 
@@ -1464,7 +2396,11 @@ async def deploy_confirm_callback(update: Update, context: ContextTypes.DEFAULT_
         await query.edit_message_text("❌ Cancelled.", reply_markup=ui.main_menu(user_id))
         return ConversationHandler.END
 
-    bot_id = f"bot_{user_id}_{int(time.time())}"
+    bot_id = f"bot_{user_id}_{uuid.uuid4().hex[:12]}"
+    deployment_env = dict(context.user_data.get("deploy_env", {}))
+    deployment_password = context.user_data.get("deploy_password", "")
+    if deployment_password:
+        deployment_env["DEPLOY_PASSWORD"] = deployment_password
     new_bot = HostedBot(
         bot_id=bot_id,
         name=context.user_data["deploy_name"],
@@ -1474,7 +2410,7 @@ async def deploy_confirm_callback(update: Update, context: ContextTypes.DEFAULT_
         mode=BotMode.PRODUCTION.value,
         created_at=datetime.now().isoformat(),
         updated_at=datetime.now().isoformat(),
-        env_vars=json.dumps(context.user_data.get("deploy_env", {}))
+        env_vars=json.dumps(deployment_env)
     )
 
     await query.edit_message_text(
@@ -1484,10 +2420,18 @@ async def deploy_confirm_callback(update: Update, context: ContextTypes.DEFAULT_
         parse_mode="HTML"
     )
 
-    success, msg = await process_mgr.deploy(new_bot, context.user_data.get("deploy_password", ""))
+    success, msg = await process_mgr.deploy(new_bot)
 
     if success:
-        db.add_bot(new_bot)
+        try:
+            db.add_bot(new_bot)
+        except Exception:
+            logger.exception("Could not persist successful deployment %s", bot_id)
+            await process_mgr.stop(bot_id)
+            db.delete_bot(bot_id)
+            success = False
+            msg = "The service started, but its database record could not be saved; the process was stopped."
+    if success:
         await query.edit_message_text(
             f"✅ <b>{new_bot.name} IS LIVE!</b>\n\n"
             f"{ui.code_block(msg)}\n\n"
@@ -1500,12 +2444,33 @@ async def deploy_confirm_callback(update: Update, context: ContextTypes.DEFAULT_
             ])
         )
     else:
+        new_bot.status = BotStatus.ERROR.value
+        new_bot.pid = None
+        new_bot.last_error = msg[:200]
+        new_bot.log_file = new_bot.log_file or str(Config.LOGS_DIR / f"{bot_id}.log")
+        try:
+            if db.get_bot(bot_id) is None:
+                db.add_bot(new_bot)
+            else:
+                db.update_bot(bot_id, status=BotStatus.ERROR.value, pid=None, last_error=new_bot.last_error)
+        except Exception:
+            logger.exception("Could not persist failed deployment %s", bot_id)
+        await notify_admins_about_bot_failure(
+            context,
+            new_bot,
+            "Hosted bot deployment failed",
+            msg,
+        )
         await query.edit_message_text(
             f"❌ <b>Deployment Failed</b>\n\n"
             f"{ui.code_block(msg[:2000])}\n\n"
-            f"Check the URL and try again.",
+            f"The attempt is saved when possible; inspect its logs and correct the repository or configuration.",
             parse_mode="HTML",
-            reply_markup=ui.main_menu(user_id)
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("📜 View Logs", callback_data=f"act_logs_{bot_id}")],
+                [InlineKeyboardButton("🔧 Manage Attempt", callback_data=f"nav_manage_{bot_id}")],
+                [InlineKeyboardButton("📋 My Bots", callback_data="nav_list")],
+            ]),
         )
 
     context.user_data.clear()
@@ -1517,28 +2482,65 @@ async def env_edit_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ST_IDLE
 
     bot = db.get_bot(bot_id)
-    if not bot or bot.owner_id != update.effective_user.id:
-        await update.message.reply_text("❌ Session expired.")
+    user_id = update.effective_user.id
+    if not can_manage_bot(bot, user_id):
+        await update.message.reply_text("❌ Session expired or access denied.")
         return ConversationHandler.END
 
     text = update.message.text.strip()
-    env_vars = {} if text.lower() == "clear" else {}
-
+    env_vars: dict[str, str] = {}
     if text.lower() != "clear":
-        for line in text.split('\n'):
-            if '=' in line:
-                k, v = line.split('=', 1)
-                env_vars[k.strip()] = v.strip()
+        for line in text.splitlines():
+            if not line.strip():
+                continue
+            if "=" not in line:
+                await update.message.reply_text("Use KEY=value on each line, or send clear to remove all variables.")
+                return ST_ENV_EDIT
+            key, value = line.split("=", 1)
+            env_vars[key.strip()] = value.strip()
 
-    db.update_bot(bot_id, env_vars=json.dumps(env_vars))
+    try:
+        validated_env = _validate_deployment_env(json.dumps(env_vars))
+    except ValueError as exc:
+        await update.message.reply_text(f"Invalid environment variables: {exc}")
+        return ST_ENV_EDIT
 
-    if bot.status == "running":
-        bot.env_vars = json.dumps(env_vars)
-        await process_mgr.restart(bot)
+    serialized_env = json.dumps(validated_env)
+    was_running = bot.status == BotStatus.RUNNING.value
+    old_pid = bot.pid
+    db.update_bot(
+        bot_id,
+        env_vars=serialized_env,
+        status=BotStatus.RESTARTING.value if was_running else bot.status,
+    )
+    restart_message = ""
+    if was_running:
+        bot.env_vars = serialized_env
+        success, message = await process_mgr.restart(bot)
+        if success:
+            db.update_bot(
+                bot_id,
+                status=BotStatus.RUNNING.value,
+                pid=bot.pid,
+                log_file=bot.log_file,
+                restart_count=bot.restart_count + 1,
+                last_error=None,
+            )
+            restart_message = "The service restarted with the new environment."
+        elif message.startswith("The existing process could not be stopped safely"):
+            db.update_bot(bot_id, status=BotStatus.RUNNING.value, pid=old_pid, last_error=message[:200])
+            restart_message = "Environment values were saved, but the old process could not be stopped safely."
+        else:
+            db.update_bot(bot_id, status=BotStatus.ERROR.value, pid=None, last_error=message[:200])
+            await notify_admins_about_bot_failure(context, bot, "Hosted bot failed after an environment update", message)
+            restart_message = "Environment values were saved, but the service failed to restart. Check its logs."
+    else:
+        restart_message = "The service will use these values the next time it starts."
 
+    context.user_data.pop("env_bot_id", None)
     await update.message.reply_html(
-        f"✅ <b>Environment updated for {bot.name}</b>\n\n"
-        f"{'🔄 Bot restarted to apply changes.' if bot.status == 'running' else ''}",
+        f"✅ <b>Environment updated for {escape(bot.name, quote=False)}</b>\n\n"
+        f"{escape(restart_message, quote=False)}",
         reply_markup=InlineKeyboardMarkup([[
             InlineKeyboardButton("🔙 Back", callback_data=f"nav_manage_{bot_id}")
         ]])
@@ -1588,6 +2590,7 @@ async def auto_heal_task(context: ContextTypes.DEFAULT_TYPE):
                     )
                     db.update_bot(bot.bot_id, status="error", pid=None, last_error=message[:200])
                     logger.error("Auto-heal circuit breaker opened for %s", bot.bot_id)
+                    await notify_admins_about_bot_failure(context, bot, "Hosted bot auto-heal circuit breaker opened", message)
                     continue
 
                 logger.warning("Auto-heal attempt %s/%s for %s", attempt_count, Config.AUTO_HEAL_MAX_RESTARTS, bot.bot_id)
@@ -1604,8 +2607,16 @@ async def auto_heal_task(context: ContextTypes.DEFAULT_TYPE):
                     )
                     logger.info("Auto-healed %s", bot.bot_id)
                 else:
-                    db.update_bot(bot.bot_id, status="error", pid=None, last_error=msg[:200])
+                    still_running = process_mgr.is_alive(bot.bot_id)
+                    db.update_bot(
+                        bot.bot_id,
+                        status="running" if still_running else "error",
+                        pid=bot.pid if still_running else None,
+                        last_error=msg[:200],
+                    )
                     logger.error("Auto-heal failed for %s", bot.bot_id)
+                    if not still_running:
+                        await notify_admins_about_bot_failure(context, bot, "Hosted bot auto-heal failed", msg)
 
             elif is_alive and bot.pid:
                 try:
@@ -1652,9 +2663,11 @@ def main():
         manager: PluginManager | None = application.bot_data.get("plugin_manager")
         if manager is not None:
             await manager.shutdown()
-        logger.info("Telegram plugins shut down")
+        await process_mgr.stop_all()
+        logger.info("Telegram plugins and hosted processes shut down")
 
     async def post_shutdown(_application: Application):
+        db.close()
         logger.info("Telegram application shutdown complete")
 
     application = (

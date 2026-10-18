@@ -1,11 +1,14 @@
 import { lookup } from "node:dns/promises";
 import { isIP } from "node:net";
+import { request as httpRequest, type IncomingMessage, type RequestOptions as HttpRequestOptions } from "node:http";
+import { request as httpsRequest, type RequestOptions as HttpsRequestOptions } from "node:https";
 import { performance } from "node:perf_hooks";
 
 export const DEFAULT_MONITOR_INTERVAL_MINUTES = 5;
 export const MIN_MONITOR_INTERVAL_MINUTES = 1;
 export const MAX_MONITOR_INTERVAL_MINUTES = 60;
 export const MONITOR_REQUEST_TIMEOUT_MS = 10_000;
+export const MONITOR_DNS_TIMEOUT_MS = 5_000;
 
 export type ProbeResult = {
   ok: boolean;
@@ -13,6 +16,11 @@ export type ProbeResult = {
   latencyMs: number;
   error: string | null;
 };
+
+export type ResolvedAddress = { address: string; family: 4 | 6 };
+export type MonitorResolver = (hostname: string) => Promise<ResolvedAddress[]>;
+export type MonitorRequester = (url: URL, address: ResolvedAddress, timeoutMs: number) => Promise<number>;
+export type ProbeDependencies = { resolveHost?: MonitorResolver; requestPinned?: MonitorRequester; timeoutMs?: number };
 
 export class InvalidMonitorTargetError extends Error {
   constructor(message: string) {
@@ -30,13 +38,24 @@ const blockedIpv4Ranges: Array<[string, number]> = [
   ["172.16.0.0", 12],
   ["192.0.0.0", 24],
   ["192.0.2.0", 24],
+  ["192.31.196.0", 24],
+  ["192.52.193.0", 24],
   ["192.88.99.0", 24],
   ["192.168.0.0", 16],
+  ["192.175.48.0", 24],
   ["198.18.0.0", 15],
   ["198.51.100.0", 24],
   ["203.0.113.0", 24],
   ["224.0.0.0", 4],
   ["240.0.0.0", 4],
+];
+
+const blockedIpv6Ranges: Array<[bigint, number]> = [
+  [ipv6ToBigInt("2001::"), 23],       // IETF protocol assignments, including ORCHID
+  [ipv6ToBigInt("2001:db8::"), 32],   // Documentation
+  [ipv6ToBigInt("2002::"), 16],       // Deprecated 6to4 transition space
+  [ipv6ToBigInt("3ffe::"), 16],        // Deprecated 6bone space
+  [ipv6ToBigInt("3fff::"), 20],        // Documentation
 ];
 
 function ipv4ToNumber(address: string): number {
@@ -48,6 +67,29 @@ function isInIpv4Range(address: string, network: string, prefix: number): boolea
   return (ipv4ToNumber(address) & mask) === (ipv4ToNumber(network) & mask);
 }
 
+function ipv6ToBigInt(address: string): bigint {
+  let normalized = address.toLowerCase().split("%")[0];
+  if (normalized.includes(".")) {
+    const lastColon = normalized.lastIndexOf(":");
+    const ipv4 = ipv4ToNumber(normalized.slice(lastColon + 1));
+    normalized = `${normalized.slice(0, lastColon + 1)}${(ipv4 >>> 16).toString(16)}:${(ipv4 & 0xffff).toString(16)}`;
+  }
+
+  const [left = "", right = ""] = normalized.split("::");
+  const leftGroups = left ? left.split(":") : [];
+  const rightGroups = right ? right.split(":") : [];
+  const missingGroups = 8 - leftGroups.length - rightGroups.length;
+  const groups = normalized.includes("::")
+    ? [...leftGroups, ...Array(Math.max(0, missingGroups)).fill("0"), ...rightGroups]
+    : leftGroups;
+  return groups.reduce((value, group) => (value << 16n) | BigInt(Number.parseInt(group || "0", 16)), 0n);
+}
+
+function isInIpv6Range(address: bigint, network: bigint, prefix: number): boolean {
+  const shift = BigInt(128 - prefix);
+  return (address >> shift) === (network >> shift);
+}
+
 export function isPublicAddress(address: string): boolean {
   const version = isIP(address);
   if (version === 4) {
@@ -55,17 +97,17 @@ export function isPublicAddress(address: string): boolean {
   }
   if (version !== 6) return false;
 
-  const normalized = address.toLowerCase().split("%")[0];
-  const mappedIpv4 = normalized.match(/::ffff:(\d{1,3}(?:\.\d{1,3}){3})$/);
-  if (mappedIpv4) return isPublicAddress(mappedIpv4[1]);
+  const value = ipv6ToBigInt(address);
+  const mappedIpv4Prefix = value >> 32n;
+  if (mappedIpv4Prefix === 0xffffn) {
+    const ipv4 = Number(value & 0xffffffffn);
+    const mappedAddress = [24, 16, 8, 0].map((shift) => (ipv4 >>> shift) & 0xff).join(".");
+    return isPublicAddress(mappedAddress);
+  }
 
-  // Only global-unicast IPv6 space (2000::/3) is routable for a monitor.
-  const firstSegment = Number.parseInt(normalized.split(":")[0] || "0", 16);
-  if ((firstSegment & 0xe000) !== 0x2000) return false;
-  // Exclude documentation, benchmarking, transition, and special-purpose ranges.
-  if (/^2001:(?:0|0000|2|0002|10|0010|db8|0db8):/i.test(normalized)) return false;
-  if (normalized.startsWith("2002:")) return false;
-  return true;
+  // Only global-unicast IPv6 space (2000::/3) is eligible for monitoring.
+  if ((value >> 125n) !== 1n) return false;
+  return !blockedIpv6Ranges.some(([network, prefix]) => isInIpv6Range(value, network, prefix));
 }
 
 export function parseMonitorUrl(raw: string): URL {
@@ -97,45 +139,108 @@ export function parseMonitorUrl(raw: string): URL {
   return url;
 }
 
-export async function validateMonitorUrl(raw: string): Promise<URL> {
-  const url = parseMonitorUrl(raw);
-  const hostname = url.hostname.replace(/^\[|\]$/g, "");
-  let addresses: string[];
-  if (isIP(hostname)) {
-    addresses = [hostname];
+async function systemResolveHost(hostname: string): Promise<ResolvedAddress[]> {
+  const records = await lookup(hostname, { all: true, verbatim: true });
+  return records.map((record) => ({ address: record.address, family: record.family as 4 | 6 }));
+}
+
+async function withDnsTimeout<T>(operation: Promise<T>): Promise<T> {
+  let timer: NodeJS.Timeout | undefined;
+  try {
+    return await Promise.race([
+      operation,
+      new Promise<T>((_resolve, reject) => {
+        timer = setTimeout(() => reject(new InvalidMonitorTargetError("The target hostname lookup timed out.")), MONITOR_DNS_TIMEOUT_MS);
+        timer.unref();
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+async function resolvePublicAddresses(hostname: string, resolver: MonitorResolver): Promise<ResolvedAddress[]> {
+  let addresses: ResolvedAddress[];
+  const family = isIP(hostname);
+  if (family) {
+    addresses = [{ address: hostname, family: family as 4 | 6 }];
   } else {
     try {
-      addresses = (await lookup(hostname, { all: true, verbatim: true })).map((record) => record.address);
-    } catch {
+      addresses = await withDnsTimeout(resolver(hostname));
+    } catch (error) {
+      if (error instanceof InvalidMonitorTargetError) throw error;
       throw new InvalidMonitorTargetError("The target hostname could not be resolved.");
     }
   }
-  if (!addresses.length || addresses.some((address) => !isPublicAddress(address))) {
+
+  const uniqueAddresses = [...new Map(addresses.map((entry) => [entry.address, entry])).values()];
+  if (!uniqueAddresses.length || uniqueAddresses.some(({ address }) => !isPublicAddress(address))) {
     throw new InvalidMonitorTargetError("The target must resolve only to public IP addresses.");
   }
+  return uniqueAddresses;
+}
+
+export async function validateMonitorUrl(raw: string, resolver: MonitorResolver = systemResolveHost): Promise<URL> {
+  const url = parseMonitorUrl(raw);
+  const hostname = url.hostname.replace(/^\[|\]$/g, "");
+  await resolvePublicAddresses(hostname, resolver);
   return url;
 }
 
-export async function probeMonitorTarget(raw: string): Promise<ProbeResult> {
-  const startedAt = performance.now();
-  try {
-    const url = await validateMonitorUrl(raw);
-    const response = await fetch(url, {
+function requestPinnedAddress(url: URL, address: ResolvedAddress, timeoutMs: number): Promise<number> {
+  return new Promise((resolve, reject) => {
+    const originalHostname = url.hostname.replace(/^\[|\]$/g, "");
+    const secure = url.protocol === "https:";
+    const options = {
+      protocol: url.protocol,
+      hostname: address.address,
+      family: address.family,
+      port: Number(url.port || (secure ? 443 : 80)),
       method: "GET",
-      redirect: "manual",
-      signal: AbortSignal.timeout(MONITOR_REQUEST_TIMEOUT_MS),
-      headers: { "user-agent": "HostingBot-KeepAlive/1.0" },
-    });
-    const latencyMs = Math.round(performance.now() - startedAt);
-    return {
-      ok: response.status >= 200 && response.status < 400,
-      statusCode: response.status,
-      latencyMs,
-      error: response.status >= 400 ? `HTTP ${response.status}` : null,
+      path: `${url.pathname || "/"}${url.search}`,
+      headers: {
+        host: url.host,
+        "user-agent": "HostingBot-KeepAlive/1.0",
+        accept: "*/*",
+        connection: "close",
+      },
+      timeout: timeoutMs,
+      ...(secure && !isIP(originalHostname) ? { servername: originalHostname } : {}),
     };
+
+    const onResponse = (response: IncomingMessage) => {
+      const statusCode = response.statusCode ?? 0;
+      response.destroy();
+      resolve(statusCode);
+    };
+    const request = secure
+      ? httpsRequest(options as HttpsRequestOptions, onResponse)
+      : httpRequest(options as HttpRequestOptions, onResponse);
+    request.setTimeout(timeoutMs, () => request.destroy(new Error("Monitor request timed out.")));
+    request.on("error", reject);
+    request.end();
+  });
+}
+
+export async function probeMonitorTarget(raw: string, dependencies: ProbeDependencies = {}): Promise<ProbeResult> {
+  const startedAt = performance.now();
+  const timeoutMs = dependencies.timeoutMs ?? MONITOR_REQUEST_TIMEOUT_MS;
+  try {
+    const url = parseMonitorUrl(raw);
+    const hostname = url.hostname.replace(/^\[|\]$/g, "");
+    const addresses = await resolvePublicAddresses(hostname, dependencies.resolveHost ?? systemResolveHost);
+    // Pin the connection to an address already checked above. Resolving the
+    // hostname again during the request would allow DNS-rebinding SSRF.
+    const statusCode = await (dependencies.requestPinned ?? requestPinnedAddress)(url, addresses[0], timeoutMs);
+    const ok = statusCode >= 200 && statusCode < 300;
+    const error = ok
+      ? null
+      : statusCode >= 300 && statusCode < 400
+        ? `Redirect response is not followed (HTTP ${statusCode}).`
+        : `HTTP ${statusCode}`;
+    return { ok, statusCode, latencyMs: Math.round(performance.now() - startedAt), error };
   } catch (error) {
-    const latencyMs = Math.round(performance.now() - startedAt);
     const message = error instanceof Error ? error.message : "Monitor request failed.";
-    return { ok: false, statusCode: null, latencyMs, error: message.slice(0, 180) };
+    return { ok: false, statusCode: null, latencyMs: Math.round(performance.now() - startedAt), error: message.slice(0, 180) };
   }
 }

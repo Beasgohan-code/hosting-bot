@@ -58,6 +58,10 @@ BOT_TOKEN=123456:replace-me ADMIN_IDS=123456789 python ultimate_hosting_bot_fixe
 
 Do not commit tokens, cookies, or a populated `hosting_data` directory. The worker's container health endpoint is available at `/livez`, `/readyz`, and `/healthz` on port `8788`; readiness becomes healthy only after the Telegram application and plugins have started. Configure `HEALTH_HOST` and `HEALTH_PORT` only if you need to change the defaults.
 
+When a deployment, manual start/restart, update, environment-change restart, or auto-heal attempt fails, the worker sends configured admins a Telegram DM with the service/owner IDs, failure reason, and recent log lines. Set `ADMIN_IDS` to comma-separated Telegram user IDs, and have each admin open the bot and send `/start` once so Telegram permits the worker to message them. Common token/password formats are redacted before logs are sent, but this is best-effort—not a guarantee that every secret is detected—so hosted applications should not print credentials to stdout/stderr. If an admin DM cannot be delivered, the worker records the send failure in its own logs.
+
+The one-click backup action creates private ZIP archives with a 100 MiB uncompressed-data and 20,000-file limit, keeps the five newest per service, and excludes `.git`, dependency/cache directories, and symbolic links. Archives up to 20 MiB are sent to the requesting user's Telegram DM; larger ones remain in the persistent worker volume.
+
 ## Docker Compose deployment
 
 The Compose stack runs the API/dashboard control plane and the Telegram worker as separate, non-root containers. It includes image-level and Compose health checks, graceful-stop windows, restart policies, read-only root filesystems, dropped Linux capabilities, bounded JSON logs, and named volumes for persistent application data.

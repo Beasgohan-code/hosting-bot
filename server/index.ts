@@ -9,17 +9,39 @@ import {
   DEFAULT_MONITOR_INTERVAL_MINUTES,
   MAX_MONITOR_INTERVAL_MINUTES,
   MIN_MONITOR_INTERVAL_MINUTES,
+  parseMonitorUrl,
   probeMonitorTarget,
   validateMonitorUrl,
 } from "./monitor.js";
+import { sendTelegramMonitorAlert } from "./notifications.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const rootDir = path.resolve(__dirname, "..");
 const dataDir = path.resolve(process.env.DATA_DIR ?? path.join(rootDir, "data"));
 const dataFile = path.join(dataDir, "monitoring.json");
 const legacyDataFile = path.join(dataDir, "services.json");
-const port = Number(process.env.PORT ?? 8787);
-const monitorTickMs = Math.max(5_000, Number(process.env.KEEPALIVE_TICK_MS ?? 15_000));
+
+function integerEnv(name: string, fallback: number, min: number, max: number): number {
+  const raw = process.env[name]?.trim();
+  if (!raw) return fallback;
+  const value = Number(raw);
+  if (!Number.isSafeInteger(value) || value < min || value > max) {
+    throw new Error(`${name} must be an integer between ${min} and ${max}.`);
+  }
+  return value;
+}
+
+const port = integerEnv("PORT", 8787, 1, 65_535);
+const monitorTickMs = integerEnv("KEEPALIVE_TICK_MS", 15_000, 5_000, 3_600_000);
+const MAX_KEEPALIVES = 100;
+const MAX_CONCURRENT_MONITOR_CHECKS = 10;
+const MAX_SSE_CLIENTS = 100;
+const API_RATE_LIMIT = 240;
+const API_RATE_WINDOW_MS = 60_000;
+const MAX_RATE_LIMIT_KEYS = 10_000;
+const KEEPALIVE_TELEGRAM_BOT_TOKEN = process.env.KEEPALIVE_TELEGRAM_BOT_TOKEN?.trim() ?? "";
+const KEEPALIVE_TELEGRAM_CHAT_ID = process.env.KEEPALIVE_TELEGRAM_CHAT_ID?.trim() ?? "";
+const telegramAlertsConfigured = Boolean(KEEPALIVE_TELEGRAM_BOT_TOKEN && KEEPALIVE_TELEGRAM_CHAT_ID);
 
 type KeepAliveStatus = "pending" | "up" | "down" | "paused";
 
@@ -60,6 +82,83 @@ type KeepAliveMonitor = {
   history: MonitorCheck[];
 };
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function storedDate(value: unknown, fallback: string | null): string | null {
+  if (typeof value !== "string") return fallback;
+  const timestamp = Date.parse(value);
+  return Number.isFinite(timestamp) ? new Date(timestamp).toISOString() : fallback;
+}
+
+function storedInteger(value: unknown, fallback = 0, min = 0, max = Number.MAX_SAFE_INTEGER): number {
+  if (typeof value !== "number" || !Number.isSafeInteger(value)) return fallback;
+  return Math.max(min, Math.min(max, value));
+}
+
+function storedNullableInteger(value: unknown, min: number, max: number): number | null {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= min && value <= max ? value : null;
+}
+
+function sanitizeCheck(value: unknown): MonitorCheck | null {
+  if (!isRecord(value)) return null;
+  const checkedAt = storedDate(value.checkedAt, null);
+  if (!checkedAt || typeof value.ok !== "boolean") return null;
+  return {
+    id: typeof value.id === "string" ? value.id.slice(0, 80) : randomUUID(),
+    checkedAt,
+    ok: value.ok,
+    statusCode: storedNullableInteger(value.statusCode, 100, 599),
+    latencyMs: typeof value.latencyMs === "number" && Number.isFinite(value.latencyMs) && value.latencyMs >= 0 ? Math.min(value.latencyMs, 3_600_000) : 0,
+    error: typeof value.error === "string" ? value.error.slice(0, 180) : null,
+  };
+}
+
+function sanitizeMonitor(value: unknown): KeepAliveMonitor | null {
+  if (!isRecord(value)) return null;
+  let url: URL;
+  try {
+    if (typeof value.url !== "string") return null;
+    url = parseMonitorUrl(value.url);
+  } catch {
+    return null;
+  }
+
+  const id = typeof value.id === "string" && /^mon_[a-zA-Z0-9_-]{4,80}$/.test(value.id)
+    ? value.id
+    : `mon_${randomUUID().slice(0, 8)}`;
+  const name = typeof value.name === "string" && value.name.trim()
+    ? value.name.trim().slice(0, 48)
+    : url.hostname.replace(/^\[|\]$/g, "").slice(0, 48);
+  const enabled = typeof value.enabled === "boolean" ? value.enabled : true;
+  const statuses: KeepAliveStatus[] = ["pending", "up", "down", "paused"];
+  const status = !enabled ? "paused" : statuses.includes(value.status as KeepAliveStatus) && value.status !== "paused"
+    ? value.status as KeepAliveStatus
+    : "pending";
+  const history = Array.isArray(value.history)
+    ? value.history.map(sanitizeCheck).filter((check): check is MonitorCheck => check !== null).slice(0, 20)
+    : [];
+
+  return {
+    id,
+    name,
+    url: url.toString(),
+    intervalMinutes: storedInteger(value.intervalMinutes, DEFAULT_MONITOR_INTERVAL_MINUTES, MIN_MONITOR_INTERVAL_MINUTES, MAX_MONITOR_INTERVAL_MINUTES),
+    enabled,
+    status,
+    createdAt: storedDate(value.createdAt, now()) ?? now(),
+    lastCheckedAt: storedDate(value.lastCheckedAt, null),
+    lastStatusCode: storedNullableInteger(value.lastStatusCode, 100, 599),
+    lastLatencyMs: typeof value.lastLatencyMs === "number" && Number.isFinite(value.lastLatencyMs) && value.lastLatencyMs >= 0 ? Math.min(value.lastLatencyMs, 3_600_000) : null,
+    consecutiveFailures: storedInteger(value.consecutiveFailures),
+    successCount: storedInteger(value.successCount),
+    failureCount: storedInteger(value.failureCount),
+    lastError: typeof value.lastError === "string" ? value.lastError.slice(0, 180) : null,
+    history,
+  };
+}
+
 const keepAliveInput = z.object({
   name: z.string().trim().min(2).max(48).optional(),
   url: z.string().trim().min(1).max(2048),
@@ -76,6 +175,8 @@ let shuttingDown = false;
 let shutdownPromise: Promise<void> | null = null;
 const monitorChecksInFlight = new Set<string>();
 const eventClients = new Set<Response>();
+const apiRateBuckets = new Map<string, { count: number; resetAt: number }>();
+const pendingNotifications = new Set<Promise<void>>();
 
 const now = () => new Date().toISOString();
 
@@ -104,6 +205,7 @@ function overviewPayload() {
   return {
     activities: [...activities],
     keepAlives: keepAlives.map(publicMonitor),
+    integrations: { telegramAlertsConfigured },
     metrics: {
       totalMonitors: keepAlives.length,
       activeMonitors,
@@ -122,9 +224,13 @@ function broadcastOverview() {
   const message = `event: overview\ndata: ${JSON.stringify(overviewPayload())}\n\n`;
   for (const client of eventClients) {
     try {
-      client.write(message);
+      if (!client.write(message)) {
+        eventClients.delete(client);
+        client.end();
+      }
     } catch {
       eventClients.delete(client);
+      client.end();
     }
   }
 }
@@ -141,55 +247,110 @@ function persist() {
   return persistQueue;
 }
 
-async function load() {
-  let content: string;
+async function parseStateFile(filename: string, content: string): Promise<Record<string, unknown> | null> {
   try {
-    content = await fs.readFile(dataFile, "utf8");
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-    try {
-      content = await fs.readFile(legacyDataFile, "utf8");
-    } catch (legacyError) {
-      if ((legacyError as NodeJS.ErrnoException).code !== "ENOENT") throw legacyError;
-      activities = [];
-      keepAlives = [];
-      await persist();
-      return;
-    }
+    const parsed: unknown = JSON.parse(content);
+    if (isRecord(parsed)) return parsed;
+  } catch {
+    // A corrupt state file is preserved below before recovery starts.
   }
 
-  const parsed = JSON.parse(content) as {
-    activities?: Array<Partial<Activity> & { serviceId?: string; serviceName?: string }>;
-    keepAlives?: KeepAliveMonitor[];
-  };
-  keepAlives = Array.isArray(parsed.keepAlives) ? parsed.keepAlives : [];
+  const backup = `${filename}.corrupt-${Date.now()}`;
+  try {
+    await fs.rename(filename, backup);
+    console.error(`[hosting-bot] invalid state file preserved as ${path.basename(backup)}`);
+  } catch (error) {
+    console.error(`[hosting-bot] could not quarantine invalid state file ${path.basename(filename)}`, error);
+  }
+  return null;
+}
 
-  // Keep real monitor history but discard the old fabricated service/deployment
-  // records from previous dashboard versions.
-  activities = (Array.isArray(parsed.activities) ? parsed.activities : []).flatMap((entry) => {
+async function readStateFile(filename: string): Promise<{ content: string; exists: boolean }> {
+  try {
+    const stat = await fs.stat(filename);
+    if (stat.size > 10 * 1024 * 1024) throw new Error("State file exceeds the 10 MB safety limit.");
+    return { content: await fs.readFile(filename, "utf8"), exists: true };
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return { content: "", exists: false };
+    throw error;
+  }
+}
+
+async function load() {
+  let sourceFile = dataFile;
+  let { content, exists } = await readStateFile(dataFile);
+  if (!exists) {
+    sourceFile = legacyDataFile;
+    ({ content, exists } = await readStateFile(legacyDataFile));
+  }
+
+  if (!exists) {
+    activities = [];
+    keepAlives = [];
+    await persist();
+    return;
+  }
+
+  let parsed = await parseStateFile(sourceFile, content);
+  if (!parsed && sourceFile === dataFile) {
+    sourceFile = legacyDataFile;
+    const legacy = await readStateFile(legacyDataFile);
+    parsed = legacy.exists ? await parseStateFile(legacyDataFile, legacy.content) : null;
+  }
+  if (!parsed) {
+    activities = [];
+    keepAlives = [];
+    await persist();
+    return;
+  }
+
+  const seenMonitorIds = new Set<string>();
+  const candidates = Array.isArray(parsed.keepAlives) ? parsed.keepAlives : [];
+  keepAlives = candidates.flatMap((entry) => {
+    const monitor = sanitizeMonitor(entry);
+    if (!monitor || seenMonitorIds.has(monitor.id)) return [];
+    seenMonitorIds.add(monitor.id);
+    return [monitor];
+  }).slice(0, MAX_KEEPALIVES);
+  if (candidates.length !== keepAlives.length) {
+    console.warn(`[hosting-bot] discarded ${candidates.length - keepAlives.length} invalid or excess monitor record(s)`);
+  }
+
+  // Preserve real monitor activity while dropping simulated service/deployment records.
+  const activityCandidates = Array.isArray(parsed.activities) ? parsed.activities : [];
+  activities = activityCandidates.flatMap((entry) => {
+    if (!isRecord(entry)) return [];
     const targetId = entry.targetId ?? entry.serviceId;
-    if (!targetId?.startsWith("mon_") || typeof entry.action !== "string") return [];
-    const tone = entry.tone === "success" || entry.tone === "warning" ? entry.tone : "info";
+    if (typeof targetId !== "string" || !targetId.startsWith("mon_") || typeof entry.action !== "string") return [];
+    const tone: Activity["tone"] = entry.tone === "success" || entry.tone === "warning" ? entry.tone : "info";
     return [{
-      id: typeof entry.id === "string" ? entry.id : randomUUID(),
+      id: typeof entry.id === "string" ? entry.id.slice(0, 80) : randomUUID(),
       targetId,
       targetName: typeof entry.targetName === "string"
-        ? entry.targetName
-        : typeof entry.serviceName === "string" ? entry.serviceName : "Monitor",
-      action: entry.action,
-      detail: typeof entry.detail === "string" ? entry.detail : "",
-      createdAt: typeof entry.createdAt === "string" ? entry.createdAt : now(),
+        ? entry.targetName.slice(0, 48)
+        : typeof entry.serviceName === "string" ? entry.serviceName.slice(0, 48) : "Monitor",
+      action: entry.action.slice(0, 80),
+      detail: typeof entry.detail === "string" ? entry.detail.slice(0, 180) : "",
+      createdAt: storedDate(entry.createdAt, now()) ?? now(),
       tone,
     }];
-  });
+  }).slice(0, 50);
 
-  // Write the cleaned schema, preserving real monitors but removing all former
-  // demo services and simulated deployment history.
   await persist();
-  try {
-    await fs.unlink(legacyDataFile);
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+  if (sourceFile === legacyDataFile) {
+    try {
+      await fs.unlink(legacyDataFile);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    }
+  } else {
+    // If the new file was valid, the old registry is obsolete after the clean
+    // replacement is safely written. A corrupt legacy file is quarantined first.
+    try {
+      await fs.unlink(legacyDataFile);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    }
   }
 }
 
@@ -206,6 +367,17 @@ function activityForMonitor(monitor: KeepAliveMonitor, action: string, detail: s
   activities = activities.slice(0, 50);
 }
 
+function queueTelegramAlert(monitor: KeepAliveMonitor, state: "down" | "recovered", detail: string) {
+  if (!telegramAlertsConfigured) return;
+  const task = sendTelegramMonitorAlert(
+    { botToken: KEEPALIVE_TELEGRAM_BOT_TOKEN, chatId: KEEPALIVE_TELEGRAM_CHAT_ID },
+    { state, monitorName: monitor.name, monitorUrl: monitor.url, detail },
+  ).then((result) => {
+    if (!result.sent) console.warn(`[hosting-bot] Telegram alert failed for monitor ${monitor.id}: ${result.error ?? "unknown error"}`);
+  });
+  pendingNotifications.add(task);
+  void task.finally(() => pendingNotifications.delete(task));
+}
 async function checkMonitor(monitor: KeepAliveMonitor, source: "scheduled" | "manual" = "scheduled") {
   if (monitorChecksInFlight.has(monitor.id)) throw new Error("A check is already running for this monitor.");
   monitorChecksInFlight.add(monitor.id);
@@ -235,14 +407,18 @@ async function checkMonitor(monitor: KeepAliveMonitor, source: "scheduled" | "ma
     const detail = result.ok
       ? `HTTP ${result.statusCode} · ${result.latencyMs} ms`
       : `${result.statusCode ? `HTTP ${result.statusCode}` : "Request failed"} · ${result.error ?? "Unknown error"}`;
-    if (result.ok && previousStatus !== "up") {
+    let alertState: "down" | "recovered" | null = null;
+    if (monitor.enabled && result.ok && previousStatus !== "up") {
       activityForMonitor(monitor, "Keep-alive target recovered", detail, "success");
-    } else if (!result.ok && previousStatus !== "down") {
+      alertState = "recovered";
+    } else if (monitor.enabled && !result.ok && previousStatus !== "down") {
       activityForMonitor(monitor, "Keep-alive target is down", detail, "warning");
+      alertState = "down";
     } else if (source === "manual") {
       activityForMonitor(monitor, "Manual keep-alive check", detail, result.ok ? "info" : "warning");
     }
     await persist();
+    if (alertState) queueTelegramAlert(monitor, alertState, detail);
     return publicMonitor(monitor);
   } finally {
     monitorChecksInFlight.delete(monitor.id);
@@ -259,7 +435,19 @@ async function runScheduledMonitorChecks() {
       const last = monitor.lastCheckedAt ? Date.parse(monitor.lastCheckedAt) : 0;
       return !last || time - last >= monitor.intervalMinutes * 60_000;
     });
-    await Promise.all(due.map((monitor) => checkMonitor(monitor)));
+    let cursor = 0;
+    const workers = Array.from({ length: Math.min(MAX_CONCURRENT_MONITOR_CHECKS, due.length) }, async () => {
+      while (cursor < due.length) {
+        const monitor = due[cursor++];
+        if (!monitor) continue;
+        try {
+          await checkMonitor(monitor);
+        } catch (error) {
+          console.error(`[hosting-bot] scheduled check failed for ${monitor.id}`, error);
+        }
+      }
+    });
+    await Promise.all(workers);
   } catch (error) {
     console.error("[hosting-bot] keep-alive scheduler error", error);
   } finally {
@@ -275,14 +463,63 @@ if (corsOrigins.size) {
     origin: (origin, callback) => callback(null, Boolean(origin && corsOrigins.has(origin)) ? origin : false),
   }));
 }
+app.use((_req, res, next) => {
+  res.setHeader("X-Content-Type-Options", "nosniff");
+  res.setHeader("Referrer-Policy", "no-referrer");
+  res.setHeader("Permissions-Policy", "camera=(), microphone=(), geolocation=()");
+  next();
+});
 app.use(express.json({ limit: "100kb" }));
-app.use((req, _res, next) => {
+app.use((req, res, next) => {
+  if (req.path.startsWith("/api/")) res.setHeader("Cache-Control", "no-store");
   if (req.path.startsWith("/api/") && req.path !== "/api/events") requestCount += 1;
   next();
 });
 app.use((req, res, next) => {
   if (shuttingDown && req.path.startsWith("/api/")) {
     return res.status(503).json({ error: "Control plane is shutting down" });
+  }
+  next();
+});
+app.use((req, res, next) => {
+  if (!req.path.startsWith("/api/") || req.path === "/api/health" || req.method === "OPTIONS") return next();
+  if (req.path === "/api/events") {
+    if (eventClients.size >= MAX_SSE_CLIENTS) {
+      return res.status(503).json({ error: "The event stream has reached its connection limit." });
+    }
+    return next();
+  }
+
+  const clientKey = req.ip || req.socket.remoteAddress || "unknown";
+  const time = Date.now();
+  let bucket = apiRateBuckets.get(clientKey);
+  if (!bucket || bucket.resetAt <= time) {
+    bucket = { count: 0, resetAt: time + API_RATE_WINDOW_MS };
+    apiRateBuckets.set(clientKey, bucket);
+  }
+  if (bucket.count >= API_RATE_LIMIT) {
+    const retryAfter = Math.max(1, Math.ceil((bucket.resetAt - time) / 1000));
+    res.setHeader("Retry-After", String(retryAfter));
+    res.setHeader("RateLimit-Limit", String(API_RATE_LIMIT));
+    res.setHeader("RateLimit-Remaining", "0");
+    res.setHeader("RateLimit-Reset", String(Math.ceil(bucket.resetAt / 1000)));
+    return res.status(429).json({ error: "API rate limit exceeded. Try again shortly." });
+  }
+  bucket.count += 1;
+  res.setHeader("RateLimit-Limit", String(API_RATE_LIMIT));
+  res.setHeader("RateLimit-Remaining", String(API_RATE_LIMIT - bucket.count));
+  res.setHeader("RateLimit-Reset", String(Math.ceil(bucket.resetAt / 1000)));
+
+  if (apiRateBuckets.size > MAX_RATE_LIMIT_KEYS) {
+    for (const [key, entry] of apiRateBuckets) {
+      if (entry.resetAt <= time) apiRateBuckets.delete(key);
+      if (apiRateBuckets.size <= MAX_RATE_LIMIT_KEYS) break;
+    }
+    while (apiRateBuckets.size > MAX_RATE_LIMIT_KEYS) {
+      const oldestKey = apiRateBuckets.keys().next().value;
+      if (oldestKey === undefined) break;
+      apiRateBuckets.delete(oldestKey);
+    }
   }
   next();
 });
@@ -297,27 +534,39 @@ app.get("/api/health", (_req, res) => {
     uptimeSeconds: Math.floor(process.uptime()),
     keepAlive: { monitored, failing },
     processMemoryMb: Math.round(process.memoryUsage().rss / 1_048_576),
+    integrations: { telegramAlertsConfigured },
   });
 });
 
 app.get("/api/overview", (_req, res) => res.json(overviewPayload()));
 
 app.get("/api/events", (req, res) => {
+  if (eventClients.size >= MAX_SSE_CLIENTS) {
+    return res.status(503).json({ error: "The event stream has reached its connection limit." });
+  }
   res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
   res.setHeader("Cache-Control", "no-cache, no-transform");
   res.setHeader("Connection", "keep-alive");
+  res.setHeader("X-Accel-Buffering", "no");
   res.flushHeaders();
   eventClients.add(res);
   res.write(`event: overview\ndata: ${JSON.stringify(overviewPayload())}\n\n`);
-  req.on("close", () => eventClients.delete(res));
+  const removeClient = () => eventClients.delete(res);
+  res.on("close", removeClient);
+  res.on("error", removeClient);
+  req.on("aborted", removeClient);
 });
 
 const heartbeat = setInterval(() => {
   for (const client of eventClients) {
     try {
-      client.write(": heartbeat\n\n");
+      if (!client.write(": heartbeat\n\n")) {
+        eventClients.delete(client);
+        client.end();
+      }
     } catch {
       eventClients.delete(client);
+      client.end();
     }
   }
 }, 15_000);
@@ -328,6 +577,9 @@ app.get("/api/keepalives", (_req, res) => {
 });
 
 app.post("/api/keepalives", async (req: Request, res: Response) => {
+  if (keepAlives.length >= MAX_KEEPALIVES) {
+    return res.status(409).json({ error: `The monitor limit of ${MAX_KEEPALIVES} has been reached.` });
+  }
   const parsed = keepAliveInput.safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: "Invalid monitor details", issues: parsed.error.issues });
 
@@ -338,12 +590,16 @@ app.post("/api/keepalives", async (req: Request, res: Response) => {
     return res.status(400).json({ error: error instanceof Error ? error.message : "Invalid monitor URL" });
   }
 
+  const normalizedUrl = url.toString();
+  if (keepAlives.some((monitor) => monitor.url === normalizedUrl)) {
+    return res.status(409).json({ error: "A monitor for this URL already exists." });
+  }
   const name = parsed.data.name?.trim() || url.hostname.replace(/^\[|\]$/g, "");
   const createdAt = now();
   const monitor: KeepAliveMonitor = {
     id: `mon_${randomUUID().slice(0, 8)}`,
     name,
-    url: url.toString(),
+    url: normalizedUrl,
     intervalMinutes: parsed.data.intervalMinutes,
     enabled: true,
     status: "pending",
@@ -369,6 +625,7 @@ app.patch("/api/keepalives/:id", async (req: Request, res: Response) => {
   if (!parsed.success) return res.status(400).json({ error: "Invalid monitor settings" });
   const monitor = keepAlives.find((entry) => entry.id === req.params.id);
   if (!monitor) return res.status(404).json({ error: "Monitor not found" });
+  if (monitor.enabled === parsed.data.enabled) return res.json(publicMonitor(monitor));
   monitor.enabled = parsed.data.enabled;
   monitor.status = monitor.enabled ? "pending" : "paused";
   if (monitor.enabled) monitor.lastCheckedAt = null;
@@ -386,9 +643,12 @@ app.post("/api/keepalives/:id/check", async (req: Request, res: Response) => {
   res.json(result);
 });
 
-app.delete("/api/keepalives/:id", async (req: Request, res: Response) => {
+app.delete("/api/keepalives/:id", async (req, res) => {
   const index = keepAlives.findIndex((entry) => entry.id === req.params.id);
   if (index < 0) return res.status(404).json({ error: "Monitor not found" });
+  if (monitorChecksInFlight.has(req.params.id)) {
+    return res.status(409).json({ error: "Wait for the active check to finish before removing this monitor." });
+  }
   const [removed] = keepAlives.splice(index, 1);
   if (removed) activityForMonitor(removed, "Keep-alive monitor removed", "The monitor was removed from the workspace", "warning");
   await persist();
